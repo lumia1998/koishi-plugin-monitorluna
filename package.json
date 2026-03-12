@@ -1,0 +1,26 @@
+{
+  "name": "koishi-plugin-screenluna",
+  "version": "1.0.0",
+  "description": "远程屏幕截图插件",
+  "main": "lib/index.js",
+  "typings": "lib/index.d.ts",
+  "files": [
+    "lib"
+  ],
+  "scripts": {
+    "build": "tsc"
+  },
+  "keywords": [
+    "chatbot",
+    "koishi",
+    "plugin",
+    "screenshot"
+  ],
+  "peerDependencies": {
+    "koishi": "^4.0.0"
+  },
+  "devDependencies": {
+    "koishi": "^4.0.0",
+    "typescript": "^5.0.0"
+  }
+}
