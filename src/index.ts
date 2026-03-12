@@ -47,7 +47,7 @@ export function apply(ctx: Context, config: Config) {
 
         return h.image(response, 'image/jpeg')
       } catch (error) {
-        return `截图失败: ${error.message}`
+        return `截图失败: ${error instanceof Error ? error.message : String(error)}`
       }
     })
 }
