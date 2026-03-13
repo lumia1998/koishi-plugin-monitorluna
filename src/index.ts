@@ -6,6 +6,40 @@ import * as fs from 'fs/promises'
 import * as path from 'path'
 
 export const name = 'monitorluna'
+
+export const usage = `
+## MonitorLuna 使用说明
+
+### 下载 Windows Agent
+
+[点击下载 monitorluna-agent.zip](https://github.com/lumia1998/koishi-plugin-monitorluna/releases/download/v1.0.0/monitorluna-agent.zip)
+
+解压后双击 \`start-server.bat\` 启动，然后访问 http://127.0.0.1:6315 配置连接信息。
+
+### 命令
+
+| 命令 | 说明 |
+|------|------|
+| \`monitor.list\` | 列出所有在线设备 |
+| \`monitor.screen <设备ID>\` | 截取设备全屏截图 |
+| \`monitor.window <设备ID>\` | 截取设备当前活跃窗口 |
+| \`monitor.status <设备ID>\` | 查看设备 CPU/内存/GPU 状态 |
+| \`monitor.analytics <设备ID>\` | 生成当天活动总结图（需要 puppeteer 插件） |
+
+### 每日总结配置示例
+
+\`\`\`yaml
+monitorluna:
+  token: your-token
+  dailySummaryEnabled: true
+  dailySummaryTime: '22:00'
+  dailySummaryTargets:
+    - deviceId: my-pc
+      channelIds:
+        - 'onebot:123456:987654321'
+\`\`\`
+`
+
 export const inject = {
   required: ['server', 'database'],
   optional: ['puppeteer']
