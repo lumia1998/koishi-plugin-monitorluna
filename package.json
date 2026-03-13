@@ -1,7 +1,7 @@
 {
   "name": "koishi-plugin-screenluna",
-  "version": "1.0.1",
-  "description": "远程屏幕截图插件",
+  "version": "1.1.0",
+  "description": "远程设备监控插件（截图、窗口信息、系统状态）",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [
@@ -25,10 +25,14 @@
     "screenshot"
   ],
   "peerDependencies": {
-    "koishi": "^4.0.0"
+    "koishi": "^4.0.0",
+    "@koishijs/plugin-server": "^5.0.0",
+    "@koishijs/plugin-puppeteer": "^3.0.0"
   },
   "devDependencies": {
     "koishi": "^4.0.0",
+    "@koishijs/plugin-server": "^5.0.0",
+    "@koishijs/plugin-puppeteer": "^3.0.0",
     "typescript": "^5.0.0"
   }
 }
