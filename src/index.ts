@@ -50,6 +50,7 @@ declare module 'koishi' {
   interface Tables {
     monitorluna_activity: ActivityLog
     monitorluna_screenshot: Screenshot
+    monitorluna_input_stats: InputStats
   }
 }
 
@@ -65,6 +66,19 @@ interface Screenshot {
   id: number
   deviceId: string
   url: string
+  timestamp: Date
+}
+
+interface InputStats {
+  id: number
+  deviceId: string
+  process: string
+  displayName: string
+  iconBase64: string
+  keyPresses: number
+  leftClicks: number
+  rightClicks: number
+  scrollDistance: number
   timestamp: Date
 }
 
@@ -304,6 +318,19 @@ export function apply(ctx: Context, config: Config) {
     timestamp: 'timestamp'
   }, { autoInc: true })
 
+  ctx.model.extend('monitorluna_input_stats', {
+    id: 'unsigned',
+    deviceId: 'string',
+    process: 'string',
+    displayName: 'string',
+    iconBase64: 'text',
+    keyPresses: 'unsigned',
+    leftClicks: 'unsigned',
+    rightClicks: 'unsigned',
+    scrollDistance: 'double',
+    timestamp: 'timestamp'
+  }, { autoInc: true })
+
   // Initialize storage
   if (config.storageType === 'local') storage = new LocalStorage(ctx, config)
   else if (config.storageType === 'webdav') storage = new WebDAVStorage(config)
@@ -353,6 +380,15 @@ export function apply(ctx: Context, config: Config) {
           return
         }
         handleActivity(msg).catch(e => ctx.logger.warn(`[monitorluna] 处理活动失败: ${e.message}`))
+        return
+      }
+
+      if (msg.type === 'input_stats') {
+        if (!deviceId) {
+          ws.close(1008, 'not authenticated')
+          return
+        }
+        handleInputStats(msg).catch(e => ctx.logger.warn(`[monitorluna] 处理输入统计失败: ${e.message}`))
         return
       }
 
@@ -422,6 +458,30 @@ export function apply(ctx: Context, config: Config) {
     }
   }
 
+  async function handleInputStats(msg: any) {
+    const deviceId = msg.device_id
+    const stats = msg.stats
+    if (!stats) return
+    if (config.debug) ctx.logger.info(`[monitorluna][debug] input_stats: device=${deviceId}, apps=${Object.keys(stats).length}`)
+    try {
+      for (const [process, data] of Object.entries(stats) as [string, any][]) {
+        await ctx.database.create('monitorluna_input_stats', {
+          deviceId,
+          process,
+          displayName: data.display_name || process,
+          iconBase64: data.icon_base64 || '',
+          keyPresses: data.key_presses || 0,
+          leftClicks: data.left_clicks || 0,
+          rightClicks: data.right_clicks || 0,
+          scrollDistance: data.scroll_distance || 0,
+          timestamp: new Date()
+        })
+      }
+    } catch (e) {
+      ctx.logger.warn(`[monitorluna] 记录输入统计失败: ${e instanceof Error ? e.message : String(e)}`)
+    }
+  }
+
   function startPeriodicScreenshot() {
     setInterval(async () => {
       for (const [deviceId] of devices) {
@@ -474,7 +534,7 @@ export function apply(ctx: Context, config: Config) {
       })
       if (records.length === 0) continue
 
-      const html = buildSummaryHtml(records, target.deviceId)
+      const html = await buildSummaryHtml(records, target.deviceId, today, tomorrow)
       const puppeteer = (ctx as any)['puppeteer']
       if (!puppeteer) {
         ctx.logger.warn('[monitorluna] puppeteer 服务未启用，跳过每日总结')
@@ -496,8 +556,51 @@ export function apply(ctx: Context, config: Config) {
     }
   }
 
-  function buildSummaryHtml(records: ActivityLog[], deviceId: string): string {
+  async function buildSummaryHtml(records: ActivityLog[], deviceId: string, today: Date, tomorrow: Date): Promise<string> {
     const date = new Date().toLocaleDateString('zh-CN')
+
+    // 格式化应用名称（去除 .exe）
+    const formatAppName = (process: string) => process.replace(/\.exe$/i, '')
+
+    // 查询输入统计数据（今天0点到现在）
+    const inputStats = await ctx.database.get('monitorluna_input_stats', {
+      deviceId,
+      timestamp: { $gte: today, $lt: new Date() }
+    })
+
+    // 构建图标映射
+    const iconMap = new Map<string, string>()
+    for (const record of inputStats) {
+      if (record.iconBase64 && !iconMap.has(record.process)) {
+        iconMap.set(record.process, record.iconBase64)
+      }
+    }
+
+    // 聚合输入统计
+    const appInputStats = new Map<string, { displayName: string, icon: string, keyPresses: number, clicks: number, scrollDistance: number }>()
+    for (const record of inputStats) {
+      const existing = appInputStats.get(record.process) || {
+        displayName: record.displayName,
+        icon: record.iconBase64,
+        keyPresses: 0,
+        clicks: 0,
+        scrollDistance: 0
+      }
+      existing.keyPresses += record.keyPresses
+      existing.clicks += record.leftClicks + record.rightClicks
+      existing.scrollDistance += record.scrollDistance
+      appInputStats.set(record.process, existing)
+    }
+
+    // TOP 6（按总输入量排序）
+    const topInputApps = [...appInputStats.entries()]
+      .sort((a, b) => (b[1].keyPresses + b[1].clicks) - (a[1].keyPresses + a[1].clicks))
+      .slice(0, 6)
+
+    // 计算最大值用于进度条
+    const maxKeys = Math.max(...topInputApps.map(([, s]) => s.keyPresses), 1)
+    const maxClicks = Math.max(...topInputApps.map(([, s]) => s.clicks), 1)
+    const maxScroll = Math.max(...topInputApps.map(([, s]) => s.scrollDistance), 1)
 
     // 按时间排序
     records.sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime())
@@ -556,7 +659,6 @@ export function apply(ctx: Context, config: Config) {
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:var(--font-body);color:var(--ink-primary);background-color:var(--bg-paper);background-image:radial-gradient(#ddd 2px,transparent 2px);background-size:20px 20px;min-height:100vh;padding:40px 20px;line-height:1.6}
 .container{max-width:900px;margin:0 auto;background:#fff;border:2px solid var(--ink-primary);border-radius:20px;padding:40px;box-shadow:8px 8px 0 var(--color-blue),16px 16px 0 var(--color-pink),0 20px 40px rgba(0,0,0,0.1)}
-.container::before{content:"";position:absolute;top:12px;bottom:12px;left:12px;right:12px;border:2px dashed var(--ink-secondary);border-radius:15px;pointer-events:none;opacity:0.5}
 .header{text-align:center;margin-bottom:40px;position:relative;padding-top:20px}
 .title-sticker{display:inline-block;background:#fff;padding:20px 40px;border:3px dashed var(--ink-primary);border-radius:15px;box-shadow:5px 5px 0 var(--color-blue);transform:rotate(-2deg);position:relative}
 .title-sticker h1{font-family:var(--font-title);font-size:2.5rem;color:var(--accent-orange);margin:0;-webkit-text-stroke:1px var(--ink-primary)}
@@ -576,7 +678,24 @@ body{font-family:var(--font-body);color:var(--ink-primary);background-color:var(
 .hour-section{margin-bottom:20px;padding:12px;border:1px dashed var(--ink-secondary);border-radius:8px;background:#fafafa}
 .hour-label{font-weight:700;color:var(--ink-secondary);margin-bottom:6px;font-size:0.95rem}
 .hour-list{display:flex;flex-wrap:wrap;gap:6px}
-.hour-tag{background:var(--color-blue);padding:3px 10px;border-radius:12px;font-size:0.85rem;color:var(--ink-primary)}
+.hour-tag{background:var(--color-blue);padding:3px 0;border-radius:12px;font-size:0.85rem;color:var(--ink-primary);display:inline-flex;overflow:hidden}
+.hour-tag-name{background:var(--color-blue);padding:3px 10px;color:var(--ink-primary)}
+.hour-tag-time{background:#fff;padding:3px 10px;color:var(--ink-primary);font-weight:600}
+.input-stats-item{padding:8px 0;border-bottom:1px dashed #e0e0e0}
+.input-stats-item:last-child{border-bottom:none}
+.app-row{display:grid;grid-template-columns:1fr 160px 120px 120px;align-items:center;gap:8px}
+.app-info{display:flex;align-items:center;gap:6px;overflow:hidden}
+.app-icon{width:16px;height:16px;border-radius:3px;flex-shrink:0}
+.app-name{font-weight:600;color:var(--ink-primary);font-size:0.85rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.bar-col{display:flex;flex-direction:column;gap:2px}
+.bar-track{background:#f0f0f0;border-radius:4px;height:16px;position:relative;overflow:hidden}
+.bar-fill-keys{background:#5c9bd6;border-radius:4px;height:100%;position:absolute;left:0;top:0}
+.bar-fill-clicks{background:#70b870;border-radius:4px;height:100%;position:absolute;left:0;top:0}
+.bar-fill-scroll{background:#d4a843;border-radius:4px;height:100%;position:absolute;left:0;top:0}
+.bar-text{position:absolute;right:4px;top:50%;transform:translateY(-50%);font-size:10px;font-weight:600;color:#fff;white-space:nowrap}
+.bar-text-outside{font-size:10px;color:var(--ink-secondary);text-align:right;margin-top:1px}
+.col-header{font-size:11px;font-weight:700;color:var(--ink-secondary);text-align:center}
+.stats-header{display:grid;grid-template-columns:1fr 160px 120px 120px;gap:8px;margin-bottom:8px;padding-bottom:6px;border-bottom:2px solid #e0e0e0}
 .footer{text-align:center;margin-top:40px;font-family:var(--font-hand);color:var(--ink-secondary);font-size:0.9rem}
 </style>
 </head><body><div class="container">
@@ -600,12 +719,41 @@ ${Array.from(hourlyActivity.entries()).map(([hour, count]) => {
 </div>
 </div>
 <div class="section">
-<div class="section-title">⏱️ 全天活跃时间 TOP 4</div>
+<div class="section-title">⌨️ 输入统计 TOP 6</div>
 <div class="list-box">
-${topDuration.map(([app, duration], idx) => `<div class="list-item">
-<div class="item-name">${idx + 1}. ${app}</div>
-<div class="item-value">${Math.round(duration)} 分钟</div>
-</div>`).join('')}
+${topInputApps.length > 0 ? `
+<div class="stats-header">
+  <div class="col-header" style="text-align:left">应用</div>
+  <div class="col-header">键盘</div>
+  <div class="col-header">鼠标</div>
+  <div class="col-header">滚轮</div>
+</div>
+${topInputApps.map(([process, stats], idx) => {
+  const keysW = Math.round(stats.keyPresses / maxKeys * 100)
+  const clicksW = Math.round(stats.clicks / maxClicks * 100)
+  const scrollW = Math.round(stats.scrollDistance / maxScroll * 100)
+  const keysInside = keysW > 30
+  const clicksInside = clicksW > 30
+  const scrollInside = scrollW > 30
+  return `<div class="input-stats-item">
+<div class="app-row">
+  <div class="app-info">
+    <span style="color:var(--ink-secondary);font-size:0.8rem;min-width:16px">${idx + 1}</span>
+    ${stats.icon ? `<img src="data:image/png;base64,${stats.icon}" class="app-icon">` : '<div style="width:16px"></div>'}
+    <span class="app-name">${formatAppName(process)}</span>
+  </div>
+  <div class="bar-col">
+    <div class="bar-track"><div class="bar-fill-keys" style="width:${keysW}%">${keysInside ? `<span class="bar-text">${stats.keyPresses.toLocaleString()}</span>` : ''}</div>${!keysInside ? `<span style="position:absolute;right:4px;top:50%;transform:translateY(-50%);font-size:10px;font-weight:600;color:#888">${stats.keyPresses.toLocaleString()}</span>` : ''}</div>
+  </div>
+  <div class="bar-col">
+    <div class="bar-track"><div class="bar-fill-clicks" style="width:${clicksW}%">${clicksInside ? `<span class="bar-text">${stats.clicks.toLocaleString()}</span>` : ''}</div>${!clicksInside ? `<span style="position:absolute;right:4px;top:50%;transform:translateY(-50%);font-size:10px;font-weight:600;color:#888">${stats.clicks.toLocaleString()}</span>` : ''}</div>
+  </div>
+  <div class="bar-col">
+    <div class="bar-track"><div class="bar-fill-scroll" style="width:${scrollW}%">${scrollInside ? `<span class="bar-text">${Math.round(stats.scrollDistance).toLocaleString()}</span>` : ''}</div>${!scrollInside ? `<span style="position:absolute;right:4px;top:50%;transform:translateY(-50%);font-size:10px;font-weight:600;color:#888">${Math.round(stats.scrollDistance).toLocaleString()}</span>` : ''}</div>
+  </div>
+</div>
+</div>`
+}).join('')}` : '<div style="color:var(--ink-secondary);text-align:center;padding:20px">暂无输入统计数据</div>'}
 </div>
 </div>
 <div class="section">
@@ -614,7 +762,11 @@ ${topDuration.map(([app, duration], idx) => `<div class="list-item">
 ${Array.from(hourlyTop4.entries()).filter(([, top]) => top.length > 0).map(([hour, top]) => `<div class="hour-section">
 <div class="hour-label">${hour}:00 - ${hour}:59</div>
 <div class="hour-list">
-${top.map(([app, dur]) => `<span class="hour-tag">${app} ${Math.round(dur)}m</span>`).join('')}
+${top.map(([app, dur]) => {
+  const icon = iconMap.get(app)
+  const iconHtml = icon ? `<img src="data:image/png;base64,${icon}" style="width:14px;height:14px;margin-right:3px;vertical-align:middle">` : ''
+  return `<span class="hour-tag"><span class="hour-tag-name">${iconHtml}${formatAppName(app)}</span><span class="hour-tag-time">${Math.round(dur)}m</span></span>`
+}).join('')}
 </div>
 </div>`).join('')}
 </div>
@@ -700,7 +852,7 @@ ${top.map(([app, dur]) => `<span class="hour-tag">${app} ${Math.round(dur)}m</sp
       if (!puppeteer) return '需要安装 puppeteer 插件才能生成总结图'
 
       try {
-        const html = buildSummaryHtml(records, device)
+        const html = await buildSummaryHtml(records, device, today, tomorrow)
         if (config.debug) ctx.logger.info(`[monitorluna][debug] html length: ${html.length}`)
 
         const page = await puppeteer.page()

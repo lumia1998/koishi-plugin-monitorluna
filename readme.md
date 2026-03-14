@@ -2,14 +2,16 @@
 
 [![npm](https://img.shields.io/npm/v/koishi-plugin-monitorluna?style=flat-square)](https://www.npmjs.com/package/koishi-plugin-monitorluna)
 
-远程设备监控插件，通过 WebSocket 连接 Windows 后台 Agent，实现远程截图、系统监控、窗口活动追踪和每日总结生成。
+远程设备监控插件，通过 WebSocket 连接 Windows/Linux 后台 Agent，实现远程截图、系统监控、窗口活动追踪、输入统计和每日总结生成。
 
 ## ✨ 功能特性
 
 - 📸 **远程截图**：全屏截图 / 当前活跃窗口截图
 - 📊 **系统监控**：实时查看 CPU、内存、GPU 使用率
 - 🪟 **窗口追踪**：自动记录窗口切换，每 2 秒检测前台应用变化
-- 📅 **每日总结**：生成手绘风格活动总结图，统计每小时和全天的应用使用时长
+- ⌨️ **输入统计**：统计各应用的键盘按键、鼠标点击、滚轮滚动次数（Windows）
+- 🖼️ **应用图标**：自动提取并显示应用程序图标（Windows）
+- 📅 **每日总结**：生成手绘风格活动总结图，包含活跃轨迹、输入统计 TOP 6、每小时 TOP 4
 - 🖼️ **定时截图**：每 15 分钟自动截图并存储
 - 💾 **多存储后端**：支持本地存储 / WebDAV / S3
 - 🔐 **Token 鉴权**：WebSocket 连接需要 Token 验证
