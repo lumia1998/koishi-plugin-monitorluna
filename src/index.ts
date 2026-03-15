@@ -16,6 +16,10 @@ export const usage = `
 
 解压后双击 \`start-silent.vbs\` 启动，然后访问 http://127.0.0.1:6315 配置连接信息。
 
+### 浏览器扩展（可选）
+
+在 \`browser-extension/\` 目录中有 Chrome/Edge 扩展，可追踪浏览器各域名的活跃时长。
+
 ### 命令
 
 | 命令 | 说明 |
@@ -25,6 +29,7 @@ export const usage = `
 | \`monitor.window <设备ID>\` | 截取设备当前活跃窗口 |
 | \`monitor.status <设备ID>\` | 查看设备 CPU/内存/GPU 状态 |
 | \`monitor.analytics <设备ID>\` | 生成当天活动总结图（需要 puppeteer 插件） |
+| \`monitor.browser <设备ID>\` | 查看今日浏览器域名时长排行 |
 
 `
 
@@ -39,6 +44,7 @@ declare module 'koishi' {
     monitorluna_activity: ActivityLog
     monitorluna_screenshot: Screenshot
     monitorluna_input_stats: InputStats
+    monitorluna_browser_activity: BrowserActivity
   }
 }
 
@@ -69,6 +75,14 @@ interface InputStats {
   leftClicks: number
   rightClicks: number
   scrollDistance: number
+  timestamp: Date
+}
+
+interface BrowserActivity {
+  id: number
+  deviceId: string
+  domain: string
+  duration: number
   timestamp: Date
 }
 
@@ -325,6 +339,14 @@ export function apply(ctx: Context, config: Config) {
     timestamp: 'timestamp'
   }, { autoInc: true })
 
+  ctx.model.extend('monitorluna_browser_activity', {
+    id: 'unsigned',
+    deviceId: 'string',
+    domain: 'string',
+    duration: 'double',
+    timestamp: 'timestamp',
+  }, { autoInc: true })
+
   // Initialize storage
   if (config.storageType === 'local') storage = new LocalStorage(ctx, config)
   else if (config.storageType === 'webdav') storage = new WebDAVStorage(config)
@@ -383,6 +405,18 @@ export function apply(ctx: Context, config: Config) {
           return
         }
         handleInputStats(msg).catch(e => ctx.logger.warn(`[monitorluna] 处理输入统计失败: ${e.message}`))
+        return
+      }
+
+      if (msg.type === 'browser_activity') {
+        // Browser extension authenticates via token in the message (not WebSocket handshake)
+        if (msg.token !== config.token) {
+          ws.send(JSON.stringify({ type: 'error', message: 'invalid token' }))
+          ws.close(1008, 'invalid token')
+          return
+        }
+        const browserDeviceId = String(msg.device_id || 'unknown')
+        handleBrowserActivity(browserDeviceId, msg).catch(e => ctx.logger.warn(`[monitorluna] 处理浏览器活动失败: ${e.message}`))
         return
       }
 
@@ -493,6 +527,41 @@ export function apply(ctx: Context, config: Config) {
     }
   }
 
+  async function handleBrowserActivity(browserDeviceId: string, msg: any) {
+    const stats = msg.stats
+    if (!stats || typeof stats !== 'object') return
+    if (config.debug) ctx.logger.info(`[monitorluna][debug] browser_activity: device=${browserDeviceId}, domains=${Object.keys(stats).length}`)
+    try {
+      const today = new Date()
+      today.setHours(0, 0, 0, 0)
+      const tomorrow = new Date(today)
+      tomorrow.setDate(tomorrow.getDate() + 1)
+
+      for (const [domain, duration] of Object.entries(stats)) {
+        if (typeof duration !== 'number' || duration <= 0) continue
+        const existing = await ctx.database.get('monitorluna_browser_activity', {
+          deviceId: browserDeviceId,
+          domain,
+          timestamp: { $gte: today, $lt: tomorrow }
+        }, { limit: 1 })
+        if (existing.length > 0) {
+          await ctx.database.set('monitorluna_browser_activity', existing[0].id, {
+            duration: existing[0].duration + duration
+          })
+        } else {
+          await ctx.database.create('monitorluna_browser_activity', {
+            deviceId: browserDeviceId,
+            domain,
+            duration,
+            timestamp: today
+          })
+        }
+      }
+    } catch (e) {
+      ctx.logger.warn(`[monitorluna] 记录浏览器活动失败: ${e instanceof Error ? e.message : String(e)}`)
+    }
+  }
+
   function startPeriodicScreenshot() {
     setInterval(async () => {
       for (const [deviceId] of devices) {
@@ -578,6 +647,19 @@ export function apply(ctx: Context, config: Config) {
       deviceId,
       timestamp: { $gte: today, $lt: new Date() }
     })
+
+    // 查询浏览器活动数据（今天）
+    const browserRecords = await ctx.database.get('monitorluna_browser_activity', {
+      deviceId,
+      timestamp: { $gte: today, $lt: new Date() }
+    })
+    // 按域名聚合（当天可能有多条记录）
+    const browserDomainMap = new Map<string, number>() // domain -> total seconds
+    for (const r of browserRecords) {
+      browserDomainMap.set(r.domain, (browserDomainMap.get(r.domain) || 0) + r.duration)
+    }
+    // 浏览器进程名称集合
+    const BROWSER_PROCESSES = new Set(['chrome.exe', 'msedge.exe', 'firefox.exe', 'brave.exe', 'opera.exe'])
 
     // 构建图标映射
     const iconMap = new Map<string, string>()
@@ -799,6 +881,18 @@ ${top.map(([app, dur]) => {
 </div>`).join('')}
 </div>
 </div>
+${browserDomainMap.size > 0 ? `<div class="section">
+<div class="section-title">🌐 浏览器域名时长 TOP 5</div>
+<div class="list-box">
+${[...browserDomainMap.entries()]
+  .sort((a, b) => b[1] - a[1])
+  .slice(0, 5)
+  .map(([domain, secs], i) => {
+    const mins = Math.round(secs / 60)
+    return `<div class="list-item"><span class="item-name">${i + 1}. ${domain}</span><span class="item-value">${mins} 分钟</span></div>`
+  }).join('')}
+</div>
+</div>` : ''}
 <div class="footer">Generated by MonitorLuna · Scrapbook Theme</div>
 </div></body></html>`
   }
@@ -898,5 +992,28 @@ ${top.map(([app, dur]) => {
       } catch (e) {
         return `生成总结失败: ${e instanceof Error ? e.message : String(e)}`
       }
+    })
+
+  monitor.subcommand('.browser <device:string>', '查看今日浏览器域名时长排行')
+    .action(async ({ session }, device) => {
+      if (!device) return '请指定设备名称'
+      const today = new Date()
+      today.setHours(0, 0, 0, 0)
+      const tomorrow = new Date(today)
+      tomorrow.setDate(tomorrow.getDate() + 1)
+
+      const records = await ctx.database.get('monitorluna_browser_activity', {
+        deviceId: device,
+        timestamp: { $gte: today, $lt: tomorrow }
+      })
+      if (records.length === 0) return '今日暂无浏览器活动记录'
+
+      const sorted = records.sort((a, b) => b.duration - a.duration).slice(0, 20)
+      let result = `今日浏览器活动 TOP ${sorted.length}：\n`
+      sorted.forEach((r, i) => {
+        const mins = Math.round(r.duration / 60)
+        result += `${i + 1}. ${r.domain} - ${mins}分钟\n`
+      })
+      return result
     })
 }
