@@ -108,6 +108,8 @@ def get_gpu_info() -> list:
 _input_stats_lock = threading.Lock()
 _app_stats = {}  # process_name -> {display_name, key_presses, left_clicks, right_clicks, scroll_distance}
 _icon_cache = {}  # process_name -> base64 string
+_last_input_time = time.time()  # 最后一次输入时间（用于 AFK 检测）
+AFK_THRESHOLD = 180  # 3 分钟无输入视为 AFK
 
 if IS_WINDOWS and WINDOWS_FEATURES:
     # Windows 钩子常量
@@ -147,6 +149,7 @@ if IS_WINDOWS and WINDOWS_FEATURES:
             }
 
     def _keyboard_proc(nCode, wParam, lParam):
+        global _last_input_time
         if nCode >= 0:
             # 从 lParam 读取虚拟键码（KBDLLHOOKSTRUCT 第一个字段）
             import ctypes
@@ -155,6 +158,7 @@ if IS_WINDOWS and WINDOWS_FEATURES:
                 # 只在键第一次按下时计数，忽略长按重复
                 if vk_code not in _pressed_keys:
                     _pressed_keys.add(vk_code)
+                    _last_input_time = time.time()
                     process_name = _get_current_process_name()
                     with _input_stats_lock:
                         _ensure_app_entry(process_name)
@@ -164,8 +168,10 @@ if IS_WINDOWS and WINDOWS_FEATURES:
         return windll.user32.CallNextHookEx(None, nCode, wParam, lParam)
 
     def _mouse_proc(nCode, wParam, lParam):
+        global _last_input_time
         if nCode >= 0:
             if wParam in (WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MOUSEWHEEL):
+                _last_input_time = time.time()
                 process_name = _get_current_process_name()
                 with _input_stats_lock:
                     _ensure_app_entry(process_name)
@@ -305,6 +311,11 @@ def extract_icon_base64(process_name: str) -> str:
     except Exception:
         _icon_cache[process_name] = ""
         return ""
+
+
+def is_afk() -> bool:
+    """检查当前是否处于 AFK 状态（超过 AFK_THRESHOLD 秒无输入）"""
+    return (time.time() - _last_input_time) > AFK_THRESHOLD
 
 
 def get_input_stats_snapshot() -> dict:
@@ -457,16 +468,19 @@ class MonitorLunaAgent:
             try:
                 if not self.paused:
                     info = await asyncio.get_event_loop().run_in_executor(None, get_window_info)
+                    afk = await asyncio.get_event_loop().run_in_executor(None, is_afk)
                     key = (info["process"], info["title"])
+                    # Send on window change OR always (to keep heartbeat endTime updated)
                     if key != self._last_window:
                         self._last_window = key
-                        await ws.send(json.dumps({
-                            "type": "activity",
-                            "device_id": device_id,
-                            "process": info["process"],
-                            "title": info["title"],
-                            "pid": info["pid"],
-                        }, ensure_ascii=False))
+                    await ws.send(json.dumps({
+                        "type": "activity",
+                        "device_id": device_id,
+                        "process": info["process"],
+                        "title": info["title"],
+                        "pid": info["pid"],
+                        "afk": afk,
+                    }, ensure_ascii=False))
             except Exception:
                 pass
             await asyncio.sleep(2)
