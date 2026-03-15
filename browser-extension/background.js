@@ -204,7 +204,7 @@ async function init() {
 }
 
 // Listen for config updates from popup
-chrome.runtime.onMessage.addListener((msg) => {
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === 'config_updated') {
     loadConfig().then(() => {
       wsConnected = false;
@@ -212,6 +212,13 @@ chrome.runtime.onMessage.addListener((msg) => {
       connect();
     });
   }
+  if (msg.type === 'get_status') {
+    sendResponse({
+      connected: wsConnected,
+      connecting: ws !== null && !wsConnected,
+    });
+  }
+  return true; // keep channel open for async
 });
 
 init();
