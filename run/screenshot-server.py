@@ -472,12 +472,19 @@ class MonitorLunaAgent:
                     afk = await asyncio.get_event_loop().run_in_executor(None, is_afk)
                     key = (info["process"], info["title"])
 
-                    # 窗口标题变化也算活跃（视频播放、直播等场景）
-                    if info["title"] != last_title and info["title"]:
-                        import builtins
-                        # 直接写全局变量
+                    # 仅对媒体播放器进程：标题变化也算活跃（视频/直播场景）
+                    # 浏览器不在此列，避免网页弹窗广告造成误判
+                    MEDIA_PROCESSES = {
+                        "vlc.exe", "mpv.exe", "mpc-hc.exe", "mpc-hc64.exe",
+                        "mpc-be.exe", "mpc-be64.exe", "potplayer.exe", "potplayermini.exe",
+                        "potplayermini64.exe", "wmplayer.exe", "groove music.exe",
+                        "spotify.exe", "foobar2000.exe", "aimp.exe", "musicbee.exe",
+                        "kodi.exe", "plex media player.exe",
+                    }
+                    proc_lower = info["process"].lower()
+                    if proc_lower in MEDIA_PROCESSES and info["title"] != last_title and info["title"]:
                         globals()["_last_input_time"] = time.time()
-                        last_title = info["title"]
+                    last_title = info["title"]
 
                     # Send on window change OR always (to keep heartbeat endTime updated)
                     if key != self._last_window:
