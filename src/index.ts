@@ -165,7 +165,41 @@ class WebDAVStorage implements StorageBackend {
   }
 
   async cleanup(days: number) {
-    // WebDAV cleanup requires listing - simplified: skip for now
+    const cutoff = new Date(Date.now() - days * 86400000)
+    const auth = Buffer.from(`${this.config.webdavUsername}:${this.config.webdavPassword}`).toString('base64')
+
+    try {
+      // PROPFIND to list files
+      const res = await fetch(this.config.webdavEndpoint, {
+        method: 'PROPFIND',
+        headers: {
+          'Authorization': `Basic ${auth}`,
+          'Depth': '1',
+          'Content-Type': 'application/xml'
+        },
+        body: '<?xml version="1.0"?><propfind xmlns="DAV:"><prop><getlastmodified/></prop></propfind>'
+      })
+      if (!res.ok) return
+
+      const xml = await res.text()
+      // Simple regex to extract href and getlastmodified
+      const hrefRegex = /<D:href>([^<]+)<\/D:href>/gi
+      const modifiedRegex = /<D:getlastmodified>([^<]+)<\/D:getlastmodified>/gi
+
+      const hrefs: string[] = []
+      const modifieds: string[] = []
+      let match
+      while ((match = hrefRegex.exec(xml)) !== null) hrefs.push(match[1])
+      while ((match = modifiedRegex.exec(xml)) !== null) modifieds.push(match[1])
+
+      for (let i = 0; i < Math.min(hrefs.length, modifieds.length); i++) {
+        const href = hrefs[i]
+        const modified = new Date(modifieds[i])
+        if (modified < cutoff && href.includes('.jpg')) {
+          await this.delete(href.split('/').pop() || '')
+        }
+      }
+    } catch {}
   }
 }
 
@@ -190,7 +224,45 @@ class S3Storage implements StorageBackend {
     await fetch(url, { method: 'DELETE', headers }).catch(() => { })
   }
 
-  async cleanup(days: number) { }
+  async cleanup(days: number) {
+    const cutoff = new Date(Date.now() - days * 86400000)
+    try {
+      // ListObjectsV2
+      const listUrl = this.getUrl('') + '?list-type=2'
+      const listHeaders = await this.signRequest('GET', '')
+      const res = await fetch(listUrl, { method: 'GET', headers: listHeaders })
+      if (!res.ok) return
+
+      const xml = await res.text()
+      // Extract keys and last modified dates
+      const keyRegex = /<Key>([^<]+)<\/Key>/g
+      const modifiedRegex = /<LastModified>([^<]+)<\/LastModified>/g
+
+      const keys: string[] = []
+      const modifieds: string[] = []
+      let match
+      while ((match = keyRegex.exec(xml)) !== null) keys.push(match[1])
+      while ((match = modifiedRegex.exec(xml)) !== null) modifieds.push(match[1])
+
+      const toDelete = keys.filter((_, i) => {
+        const modified = new Date(modifieds[i])
+        return modified < cutoff
+      })
+
+      if (toDelete.length === 0) return
+
+      // DeleteObjects (batch)
+      const deleteXml = [
+        '<?xml version="1.0"?><Delete>',
+        ...toDelete.map(k => `<Object><Key>${k}</Key></Object>`),
+        '</Delete>'
+      ].join('')
+      const deleteBuf = Buffer.from(deleteXml)
+      const deleteUrl = this.getUrl('') + '?delete'
+      const deleteHeaders = await this.signRequest('POST', '', deleteBuf)
+      await fetch(deleteUrl, { method: 'POST', headers: deleteHeaders, body: deleteBuf as unknown as BodyInit })
+    } catch {}
+  }
 
   private getUrl(key: string) {
     const { s3Endpoint, s3Bucket, s3PathStyle } = this.config
