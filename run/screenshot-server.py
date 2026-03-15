@@ -385,6 +385,7 @@ class MonitorLunaAgent:
         self.config = load_config()
         self.status = "未连接"
         self.running = True
+        self.paused = False
         self._loop = None
         self._ws = None
         self._last_window = None
@@ -430,6 +431,7 @@ class MonitorLunaAgent:
                 self._last_window = None
                 monitor_task = asyncio.get_event_loop().create_task(self._window_monitor(ws, cfg["device_id"]))
                 stats_task = asyncio.get_event_loop().create_task(self._input_stats_sender(ws, cfg["device_id"]))
+                status_task = asyncio.get_event_loop().create_task(self._update_status(cfg["device_id"]))
                 try:
                     async for raw in ws:
                         if not self.running:
@@ -444,6 +446,7 @@ class MonitorLunaAgent:
                 finally:
                     monitor_task.cancel()
                     stats_task.cancel()
+                    status_task.cancel()
                     self._ws = None
         except Exception as e:
             self.status = f"断开: {e}"
@@ -452,17 +455,18 @@ class MonitorLunaAgent:
     async def _window_monitor(self, ws, device_id: str):
         while True:
             try:
-                info = await asyncio.get_event_loop().run_in_executor(None, get_window_info)
-                key = (info["process"], info["title"])
-                if key != self._last_window:
-                    self._last_window = key
-                    await ws.send(json.dumps({
-                        "type": "activity",
-                        "device_id": device_id,
-                        "process": info["process"],
-                        "title": info["title"],
-                        "pid": info["pid"],
-                    }, ensure_ascii=False))
+                if not self.paused:
+                    info = await asyncio.get_event_loop().run_in_executor(None, get_window_info)
+                    key = (info["process"], info["title"])
+                    if key != self._last_window:
+                        self._last_window = key
+                        await ws.send(json.dumps({
+                            "type": "activity",
+                            "device_id": device_id,
+                            "process": info["process"],
+                            "title": info["title"],
+                            "pid": info["pid"],
+                        }, ensure_ascii=False))
             except Exception:
                 pass
             await asyncio.sleep(2)
@@ -471,15 +475,28 @@ class MonitorLunaAgent:
         while True:
             await asyncio.sleep(30)  # 每 30 秒发送一次
             try:
-                stats = await asyncio.get_event_loop().run_in_executor(None, get_input_stats_snapshot)
-                if stats:
-                    await ws.send(json.dumps({
-                        "type": "input_stats",
-                        "device_id": device_id,
-                        "stats": stats,
-                    }, ensure_ascii=False))
+                if not self.paused:
+                    stats = await asyncio.get_event_loop().run_in_executor(None, get_input_stats_snapshot)
+                    if stats:
+                        await ws.send(json.dumps({
+                            "type": "input_stats",
+                            "device_id": device_id,
+                            "stats": stats,
+                        }, ensure_ascii=False))
             except Exception:
                 pass
+
+    async def _update_status(self, device_id: str):
+        while True:
+            await asyncio.sleep(1)
+            if self.paused:
+                self.status = f"已暂停 ⏸ ({device_id})"
+            else:
+                self.status = f"已连接 ✓ ({device_id})"
+
+    def toggle_pause(self):
+        self.paused = not self.paused
+        return self.paused
 
     async def run_forever(self):
         delay = 3
@@ -520,6 +537,8 @@ label{display:block;margin:16px 0 6px;font-weight:600;color:#555}
 input{width:100%;padding:10px;border:1px solid #ddd;border-radius:4px;box-sizing:border-box;font-size:14px}
 button{background:#1976d2;color:#fff;border:none;padding:12px 24px;border-radius:4px;cursor:pointer;font-size:14px;margin-top:20px}
 button:hover{background:#1565c0}
+button.pause{background:#f57c00}
+button.pause:hover{background:#e65100}
 .msg{padding:12px;margin-top:16px;border-radius:4px;display:none}
 .msg.success{background:#c8e6c9;color:#2e7d32}
 .msg.error{background:#ffcdd2;color:#c62828}
@@ -537,6 +556,7 @@ button:hover{background:#1565c0}
 <label>Device ID</label>
 <input type="text" id="device_id" placeholder="my-pc" required>
 <button type="submit">保存并重连</button>
+<button type="button" class="pause" id="pauseBtn" onclick="togglePause()">暂停监控</button>
 </form>
 <div class="msg" id="msg"></div>
 </div>
@@ -553,6 +573,14 @@ async function updateStatus(){
   const r=await fetch('/api/status');
   const d=await r.json();
   document.getElementById('status').textContent='状态: '+d.status;
+  const paused=d.status.includes('暂停');
+  const btn=document.getElementById('pauseBtn');
+  btn.textContent=paused?'恢复监控':'暂停监控';
+  btn.className=paused?'pause':'';
+}
+async function togglePause(){
+  await fetch('/api/toggle_pause',{method:'POST'});
+  updateStatus();
 }
 document.getElementById('form').onsubmit=async(e)=>{
   e.preventDefault();
@@ -608,6 +636,12 @@ async def handle_status(request):
     return web.json_response({"status": agent.status})
 
 
+async def handle_toggle_pause(request):
+    agent = request.app["agent"]
+    paused = agent.toggle_pause()
+    return web.json_response({"paused": paused})
+
+
 def start_webui(agent: MonitorLunaAgent):
     app = web.Application()
     app["agent"] = agent
@@ -615,6 +649,7 @@ def start_webui(agent: MonitorLunaAgent):
     app.router.add_get("/api/config", handle_get_config)
     app.router.add_post("/api/config", handle_post_config)
     app.router.add_get("/api/status", handle_status)
+    app.router.add_post("/api/toggle_pause", handle_toggle_pause)
     web.run_app(app, host="127.0.0.1", port=WEBUI_PORT, print=None)
 
 
@@ -641,12 +676,16 @@ def main():
         def on_settings(icon, item):
             webbrowser.open(f"http://127.0.0.1:{WEBUI_PORT}")
 
+        def on_toggle_pause(icon, item):
+            agent.toggle_pause()
+
         def on_quit(icon, item):
             agent.stop()
             icon.stop()
 
         menu = pystray.Menu(
             pystray.MenuItem("打开设置", on_settings),
+            pystray.MenuItem("暂停/恢复", on_toggle_pause),
             pystray.MenuItem("退出", on_quit),
         )
 

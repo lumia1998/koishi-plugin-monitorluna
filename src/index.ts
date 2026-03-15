@@ -1,7 +1,7 @@
 import { Context, Schema, h } from 'koishi'
 import { IncomingMessage } from 'http'
 import { WebSocket } from 'ws'
-import {} from '@koishijs/plugin-server'
+import { } from '@koishijs/plugin-server'
 import * as fs from 'fs/promises'
 import * as path from 'path'
 
@@ -12,9 +12,9 @@ export const usage = `
 
 ### 下载 Windows Agent
 
-[点击下载 monitorluna-agent.zip](https://github.com/lumia1998/koishi-plugin-monitorluna/releases/download/v1.0.0/monitorluna-agent.zip)
+[点击下载 monitorluna-agent.zip](https://github.com/lumia1998/koishi-plugin-monitorluna/releases/download/v1.1.1/monitorluna-agent.zip)
 
-解压后双击 \`start-server.bat\` 启动，然后访问 http://127.0.0.1:6315 配置连接信息。
+解压后双击 \`start-silent.vbs\` 启动，然后访问 http://127.0.0.1:6315 配置连接信息。
 
 ### 命令
 
@@ -26,18 +26,6 @@ export const usage = `
 | \`monitor.status <设备ID>\` | 查看设备 CPU/内存/GPU 状态 |
 | \`monitor.analytics <设备ID>\` | 生成当天活动总结图（需要 puppeteer 插件） |
 
-### 每日总结配置示例
-
-\`\`\`yaml
-monitorluna:
-  token: your-token
-  dailySummaryEnabled: true
-  dailySummaryTime: '22:00'
-  dailySummaryTargets:
-    - deviceId: my-pc
-      channelIds:
-        - 'onebot:123456:987654321'
-\`\`\`
 `
 
 export const inject = {
@@ -92,7 +80,7 @@ interface StorageBackend {
 
 // ── Local Storage ──
 class LocalStorage implements StorageBackend {
-  constructor(private ctx: Context, private config: Config) {}
+  constructor(private ctx: Context, private config: Config) { }
 
   async init() {
     const dir = path.join(this.ctx.baseDir, this.config.storagePath || 'data/monitorluna')
@@ -121,7 +109,7 @@ class LocalStorage implements StorageBackend {
 
   async delete(key: string) {
     const dir = path.join(this.ctx.baseDir, this.config.storagePath || 'data/monitorluna')
-    await fs.unlink(path.join(dir, key)).catch(() => {})
+    await fs.unlink(path.join(dir, key)).catch(() => { })
   }
 
   async cleanup(days: number) {
@@ -137,18 +125,19 @@ class LocalStorage implements StorageBackend {
 
 // ── WebDAV Storage ──
 class WebDAVStorage implements StorageBackend {
-  constructor(private config: Config) {}
+  constructor(private config: Config) { }
 
-  async init() {}
+  async init() { }
 
   async upload(buffer: Buffer, filename: string) {
     const url = `${this.config.webdavEndpoint}/${filename}`
     const auth = Buffer.from(`${this.config.webdavUsername}:${this.config.webdavPassword}`).toString('base64')
-    await fetch(url, {
+    const res = await fetch(url, {
       method: 'PUT',
       headers: { 'Authorization': `Basic ${auth}` },
       body: buffer as unknown as BodyInit
     })
+    if (!res.ok) throw new Error(`WebDAV upload failed: ${res.status} ${res.statusText}`)
     const publicUrl = this.config.webdavPublicUrl || this.config.webdavEndpoint
     return { key: filename, url: `${publicUrl}/${filename}` }
   }
@@ -156,7 +145,7 @@ class WebDAVStorage implements StorageBackend {
   async delete(key: string) {
     const url = `${this.config.webdavEndpoint}/${key}`
     const auth = Buffer.from(`${this.config.webdavUsername}:${this.config.webdavPassword}`).toString('base64')
-    await fetch(url, { method: 'DELETE', headers: { 'Authorization': `Basic ${auth}` } }).catch(() => {})
+    await fetch(url, { method: 'DELETE', headers: { 'Authorization': `Basic ${auth}` } }).catch(() => { })
   }
 
   async cleanup(days: number) {
@@ -166,14 +155,15 @@ class WebDAVStorage implements StorageBackend {
 
 // ── S3 Storage ──
 class S3Storage implements StorageBackend {
-  constructor(private config: Config) {}
+  constructor(private config: Config) { }
 
-  async init() {}
+  async init() { }
 
   async upload(buffer: Buffer, filename: string) {
     const url = this.getUrl(filename)
     const headers = await this.signRequest('PUT', filename, buffer)
-    await fetch(url, { method: 'PUT', headers, body: buffer as unknown as BodyInit })
+    const res = await fetch(url, { method: 'PUT', headers, body: buffer as unknown as BodyInit })
+    if (!res.ok) throw new Error(`S3 upload failed: ${res.status} ${res.statusText}`)
     const publicUrl = this.config.s3PublicUrl || url
     return { key: filename, url: publicUrl }
   }
@@ -181,10 +171,10 @@ class S3Storage implements StorageBackend {
   async delete(key: string) {
     const url = this.getUrl(key)
     const headers = await this.signRequest('DELETE', key)
-    await fetch(url, { method: 'DELETE', headers }).catch(() => {})
+    await fetch(url, { method: 'DELETE', headers }).catch(() => { })
   }
 
-  async cleanup(days: number) {}
+  async cleanup(days: number) { }
 
   private getUrl(key: string) {
     const { s3Endpoint, s3Bucket, s3PathStyle } = this.config
@@ -294,7 +284,7 @@ interface DeviceConnection {
 }
 
 function generateId(): string {
-  return Math.random().toString(36).slice(2) + Date.now().toString(36)
+  return crypto.randomUUID()
 }
 
 // ── Main Plugin ──
@@ -442,7 +432,7 @@ export function apply(ctx: Context, config: Config) {
   }
 
   async function handleActivity(msg: any) {
-    const deviceId = msg.device_id
+    if (!deviceId) return
     const process = msg.process
     const title = msg.title
     if (config.debug) ctx.logger.info(`[monitorluna][debug] activity: device=${deviceId}, process=${process}, title=${title}`)
@@ -459,23 +449,25 @@ export function apply(ctx: Context, config: Config) {
   }
 
   async function handleInputStats(msg: any) {
-    const deviceId = msg.device_id
+    if (!deviceId) return
     const stats = msg.stats
     if (!stats) return
     if (config.debug) ctx.logger.info(`[monitorluna][debug] input_stats: device=${deviceId}, apps=${Object.keys(stats).length}`)
     try {
-      for (const [process, data] of Object.entries(stats) as [string, any][]) {
-        await ctx.database.create('monitorluna_input_stats', {
-          deviceId,
-          process,
-          displayName: data.display_name || process,
-          iconBase64: data.icon_base64 || '',
-          keyPresses: data.key_presses || 0,
-          leftClicks: data.left_clicks || 0,
-          rightClicks: data.right_clicks || 0,
-          scrollDistance: data.scroll_distance || 0,
-          timestamp: new Date()
-        })
+      const now = new Date()
+      const rows = (Object.entries(stats) as [string, any][]).map(([process, data]) => ({
+        deviceId,
+        process,
+        displayName: data.display_name || process,
+        iconBase64: data.icon_base64 || '',
+        keyPresses: data.key_presses || 0,
+        leftClicks: data.left_clicks || 0,
+        rightClicks: data.right_clicks || 0,
+        scrollDistance: data.scroll_distance || 0,
+        timestamp: now
+      }))
+      for (const row of rows) {
+        await ctx.database.create('monitorluna_input_stats', row)
       }
     } catch (e) {
       ctx.logger.warn(`[monitorluna] 记录输入统计失败: ${e instanceof Error ? e.message : String(e)}`)
@@ -712,9 +704,9 @@ body{font-family:var(--font-body);color:var(--ink-primary);background-color:var(
 <div class="chart-box">
 <div class="chart">
 ${Array.from(hourlyActivity.entries()).map(([hour, count]) => {
-  const height = count > 0 ? (count / maxActivity * 100) : 2
-  return `<div class="bar" style="height:${height}%"><div class="bar-label">${hour}</div></div>`
-}).join('')}
+      const height = count > 0 ? (count / maxActivity * 100) : 2
+      return `<div class="bar" style="height:${height}%"><div class="bar-label">${hour}</div></div>`
+    }).join('')}
 </div>
 </div>
 </div>
@@ -729,13 +721,13 @@ ${topInputApps.length > 0 ? `
   <div class="col-header">滚轮</div>
 </div>
 ${topInputApps.map(([process, stats], idx) => {
-  const keysW = Math.round(stats.keyPresses / maxKeys * 100)
-  const clicksW = Math.round(stats.clicks / maxClicks * 100)
-  const scrollW = Math.round(stats.scrollDistance / maxScroll * 100)
-  const keysInside = keysW > 30
-  const clicksInside = clicksW > 30
-  const scrollInside = scrollW > 30
-  return `<div class="input-stats-item">
+      const keysW = Math.round(stats.keyPresses / maxKeys * 100)
+      const clicksW = Math.round(stats.clicks / maxClicks * 100)
+      const scrollW = Math.round(stats.scrollDistance / maxScroll * 100)
+      const keysInside = keysW > 30
+      const clicksInside = clicksW > 30
+      const scrollInside = scrollW > 30
+      return `<div class="input-stats-item">
 <div class="app-row">
   <div class="app-info">
     <span style="color:var(--ink-secondary);font-size:0.8rem;min-width:16px">${idx + 1}</span>
@@ -753,7 +745,7 @@ ${topInputApps.map(([process, stats], idx) => {
   </div>
 </div>
 </div>`
-}).join('')}` : '<div style="color:var(--ink-secondary);text-align:center;padding:20px">暂无输入统计数据</div>'}
+    }).join('')}` : '<div style="color:var(--ink-secondary);text-align:center;padding:20px">暂无输入统计数据</div>'}
 </div>
 </div>
 <div class="section">
@@ -763,10 +755,10 @@ ${Array.from(hourlyTop4.entries()).filter(([, top]) => top.length > 0).map(([hou
 <div class="hour-label">${hour}:00 - ${hour}:59</div>
 <div class="hour-list">
 ${top.map(([app, dur]) => {
-  const icon = iconMap.get(app)
-  const iconHtml = icon ? `<img src="data:image/png;base64,${icon}" style="width:14px;height:14px;margin-right:3px;vertical-align:middle">` : ''
-  return `<span class="hour-tag"><span class="hour-tag-name">${iconHtml}${formatAppName(app)}</span><span class="hour-tag-time">${Math.round(dur)}m</span></span>`
-}).join('')}
+      const icon = iconMap.get(app)
+      const iconHtml = icon ? `<img src="data:image/png;base64,${icon}" style="width:14px;height:14px;margin-right:3px;vertical-align:middle">` : ''
+      return `<span class="hour-tag"><span class="hour-tag-name">${iconHtml}${formatAppName(app)}</span><span class="hour-tag-time">${Math.round(dur)}m</span></span>`
+    }).join('')}
 </div>
 </div>`).join('')}
 </div>
