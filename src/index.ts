@@ -4,6 +4,7 @@ import { WebSocket } from 'ws'
 import { } from '@koishijs/plugin-server'
 import * as fs from 'fs/promises'
 import * as path from 'path'
+import * as crypto from 'crypto'
 
 export const name = 'monitorluna'
 
@@ -45,6 +46,7 @@ declare module 'koishi' {
     monitorluna_screenshot: Screenshot
     monitorluna_input_stats: InputStats
     monitorluna_browser_activity: BrowserActivity
+    monitorluna_icon: IconEntry
   }
 }
 
@@ -86,6 +88,12 @@ interface BrowserActivity {
   timestamp: Date
 }
 
+interface IconEntry {
+  id: number
+  process: string
+  iconBase64: string
+}
+
 // ── Storage Backend Interface ──
 interface StorageBackend {
   upload(buffer: Buffer, filename: string): Promise<{ key: string; url: string }>
@@ -105,8 +113,19 @@ class LocalStorage implements StorageBackend {
     // Mount HTTP route
     this.ctx.server.get('/monitorluna/:filename', async (ctx) => {
       try {
-        const file = path.join(dir, ctx.params.filename)
-        const buf = await fs.readFile(file)
+        const filename = path.basename(ctx.params.filename)
+        // Whitelist: only allow safe filename characters
+        if (!/^[a-zA-Z0-9_\-]+\.(jpg|jpeg|png)$/i.test(filename)) {
+          ctx.status = 400
+          return
+        }
+        const filepath = path.resolve(dir, filename)
+        // Ensure resolved path is still within the storage directory
+        if (!filepath.startsWith(path.resolve(dir))) {
+          ctx.status = 403
+          return
+        }
+        const buf = await fs.readFile(filepath)
         ctx.type = 'image/jpeg'
         ctx.body = buf
       } catch {
@@ -117,7 +136,12 @@ class LocalStorage implements StorageBackend {
 
   async upload(buffer: Buffer, filename: string) {
     const dir = path.join(this.ctx.baseDir, this.config.storagePath || 'data/monitorluna')
-    const filepath = path.join(dir, filename)
+    const safeFilename = path.basename(filename)
+    const filepath = path.resolve(dir, safeFilename)
+    // Ensure resolved path stays within storage directory
+    if (!filepath.startsWith(path.resolve(dir))) {
+      throw new Error('invalid filename')
+    }
     await fs.writeFile(filepath, buffer)
     const baseUrl = this.config.serverPath || 'http://127.0.0.1:5140'
     return { key: filename, url: `${baseUrl}/monitorluna/${filename}` }
@@ -183,9 +207,9 @@ class WebDAVStorage implements StorageBackend {
       if (!res.ok) return
 
       const xml = await res.text()
-      // Simple regex to extract href and getlastmodified
-      const hrefRegex = /<D:href>([^<]+)<\/D:href>/gi
-      const modifiedRegex = /<D:getlastmodified>([^<]+)<\/D:getlastmodified>/gi
+      // Match href/getlastmodified with or without namespace prefix (D:, d:, lp1:, etc.)
+      const hrefRegex = /<(?:[a-zA-Z0-9]+:)?href>([^<]+)<\/(?:[a-zA-Z0-9]+:)?href>/gi
+      const modifiedRegex = /<(?:[a-zA-Z0-9]+:)?getlastmodified>([^<]+)<\/(?:[a-zA-Z0-9]+:)?getlastmodified>/gi
 
       const hrefs: string[] = []
       const modifieds: string[] = []
@@ -193,10 +217,11 @@ class WebDAVStorage implements StorageBackend {
       while ((match = hrefRegex.exec(xml)) !== null) hrefs.push(match[1])
       while ((match = modifiedRegex.exec(xml)) !== null) modifieds.push(match[1])
 
-      for (let i = 0; i < Math.min(hrefs.length, modifieds.length); i++) {
+      // Skip first entry (the collection/directory itself)
+      for (let i = 1; i < Math.min(hrefs.length, modifieds.length); i++) {
         const href = hrefs[i]
         const modified = new Date(modifieds[i])
-        if (modified < cutoff && href.includes('.jpg')) {
+        if (modified < cutoff && /\.(jpg|jpeg|png)$/i.test(href)) {
           await this.delete(href.split('/').pop() || '')
         }
       }
@@ -212,7 +237,7 @@ class S3Storage implements StorageBackend {
 
   async upload(buffer: Buffer, filename: string) {
     const url = this.getUrl(filename)
-    const headers = await this.signRequest('PUT', filename, buffer)
+    const headers = this.signRequest('PUT', url, buffer, 'image/jpeg')
     const res = await fetch(url, { method: 'PUT', headers, body: buffer as unknown as BodyInit })
     if (!res.ok) throw new Error(`S3 upload failed: ${res.status} ${res.statusText}`)
     const publicUrl = this.config.s3PublicUrl || url
@@ -221,7 +246,7 @@ class S3Storage implements StorageBackend {
 
   async delete(key: string) {
     const url = this.getUrl(key)
-    const headers = await this.signRequest('DELETE', key)
+    const headers = this.signRequest('DELETE', url)
     await fetch(url, { method: 'DELETE', headers }).catch(() => { })
   }
 
@@ -229,20 +254,27 @@ class S3Storage implements StorageBackend {
     const cutoff = new Date(Date.now() - days * 86400000)
     if (!this.config.s3Endpoint) return
     try {
-      const listUrl = this.getUrl('') + '?list-type=2'
-      const listHeaders = await this.signRequest('GET', '')
-      const res = await fetch(listUrl, { method: 'GET', headers: listHeaders })
-      if (!res.ok) return
-
-      const xml = await res.text()
-      const keyRegex = /<Key>([^<]+)<\/Key>/g
-      const modifiedRegex = /<LastModified>([^<]+)<\/LastModified>/g
-
+      // List all objects (handle pagination)
       const keys: string[] = []
       const modifieds: string[] = []
-      let match
-      while ((match = keyRegex.exec(xml)) !== null) keys.push(match[1])
-      while ((match = modifiedRegex.exec(xml)) !== null) modifieds.push(match[1])
+      let continuationToken = ''
+      do {
+        let listUrl = this.getUrl('') + '?list-type=2&max-keys=1000'
+        if (continuationToken) listUrl += `&continuation-token=${encodeURIComponent(continuationToken)}`
+        const listHeaders = this.signRequest('GET', listUrl)
+        const res = await fetch(listUrl, { method: 'GET', headers: listHeaders })
+        if (!res.ok) return
+
+        const xml = await res.text()
+        const keyRegex = /<Key>([^<]+)<\/Key>/g
+        const modifiedRegex = /<LastModified>([^<]+)<\/LastModified>/g
+        let match
+        while ((match = keyRegex.exec(xml)) !== null) keys.push(match[1])
+        while ((match = modifiedRegex.exec(xml)) !== null) modifieds.push(match[1])
+
+        const tokenMatch = /<NextContinuationToken>([^<]+)<\/NextContinuationToken>/.exec(xml)
+        continuationToken = tokenMatch ? tokenMatch[1] : ''
+      } while (continuationToken)
 
       const toDelete = keys.filter((_, i) => {
         const modified = new Date(modifieds[i])
@@ -251,15 +283,21 @@ class S3Storage implements StorageBackend {
 
       if (toDelete.length === 0) return
 
-      const deleteXml = [
-        '<?xml version="1.0"?><Delete>',
-        ...toDelete.map(k => `<Object><Key>${k}</Key></Object>`),
-        '</Delete>'
-      ].join('')
-      const deleteBuf = Buffer.from(deleteXml)
-      const deleteUrl = this.getUrl('') + '?delete'
-      const deleteHeaders = await this.signRequest('POST', '', deleteBuf)
-      await fetch(deleteUrl, { method: 'POST', headers: deleteHeaders, body: deleteBuf as unknown as BodyInit })
+      // Batch delete (max 1000 per request)
+      for (let i = 0; i < toDelete.length; i += 1000) {
+        const batch = toDelete.slice(i, i + 1000)
+        const deleteXml = [
+          '<?xml version="1.0" encoding="UTF-8"?><Delete xmlns="http://s3.amazonaws.com/doc/2006-03-01/">',
+          ...batch.map(k => `<Object><Key>${k}</Key></Object>`),
+          '</Delete>'
+        ].join('')
+        const deleteBuf = Buffer.from(deleteXml)
+        const deleteUrl = this.getUrl('') + '?delete'
+        const md5 = crypto.createHash('md5').update(deleteBuf).digest('base64')
+        const deleteHeaders = this.signRequest('POST', deleteUrl, deleteBuf, 'application/xml')
+        deleteHeaders['Content-MD5'] = md5
+        await fetch(deleteUrl, { method: 'POST', headers: deleteHeaders, body: deleteBuf as unknown as BodyInit })
+      }
     } catch {}
   }
 
@@ -270,22 +308,50 @@ class S3Storage implements StorageBackend {
     return `${s3Endpoint.replace('://', `://${s3Bucket}.`)}/${key}`
   }
 
-  private async signRequest(method: string, key: string, body?: Buffer) {
-    const date = new Date().toUTCString()
-    const contentType = 'image/jpeg'
-    const resource = `/${this.config.s3Bucket}/${key}`
-    const stringToSign = `${method}\n\n${contentType}\n${date}\n${resource}`
+  private signRequest(method: string, fullUrl: string, body?: Buffer, contentType?: string): Record<string, string> {
+    const region = this.config.s3Region || 'us-east-1'
+    const now = new Date()
+    const dateStamp = now.toISOString().slice(0, 10).replace(/-/g, '')
+    const amzDate = dateStamp + 'T' + now.toISOString().slice(11, 19).replace(/:/g, '') + 'Z'
 
-    const crypto = await import('crypto')
+    const parsedUrl = new URL(fullUrl)
+    const payloadHash = crypto.createHash('sha256').update(body || '').digest('hex')
+
+    const headerEntries: [string, string][] = [
+      ['host', parsedUrl.host],
+      ['x-amz-content-sha256', payloadHash],
+      ['x-amz-date', amzDate],
+    ]
+    if (contentType) headerEntries.push(['content-type', contentType])
+    headerEntries.sort(([a], [b]) => a.localeCompare(b))
+
+    const canonicalHeaders = headerEntries.map(([k, v]) => `${k}:${v}`).join('\n') + '\n'
+    const signedHeaders = headerEntries.map(([k]) => k).join(';')
+    const params = [...parsedUrl.searchParams.entries()]
+    params.sort(([a], [b]) => a.localeCompare(b))
+    const canonicalQuerystring = params.map(([k, v]) =>
+      `${encodeURIComponent(k)}=${encodeURIComponent(v)}`
+    ).join('&')
+
+    const canonicalRequest = [method, parsedUrl.pathname, canonicalQuerystring, canonicalHeaders, signedHeaders, payloadHash].join('\n')
+    const credentialScope = `${dateStamp}/${region}/s3/aws4_request`
+    const stringToSign = ['AWS4-HMAC-SHA256', amzDate, credentialScope,
+      crypto.createHash('sha256').update(canonicalRequest).digest('hex')].join('\n')
+
     const secret = this.config.s3SecretAccessKey || ''
-    const signature = crypto.createHmac('sha1', secret)
-      .update(stringToSign).digest('base64')
+    const kDate = crypto.createHmac('sha256', `AWS4${secret}`).update(dateStamp).digest()
+    const kRegion = crypto.createHmac('sha256', kDate).update(region).digest()
+    const kService = crypto.createHmac('sha256', kRegion).update('s3').digest()
+    const kSigning = crypto.createHmac('sha256', kService).update('aws4_request').digest()
+    const signature = crypto.createHmac('sha256', kSigning).update(stringToSign).digest('hex')
 
-    return {
-      'Authorization': `AWS ${this.config.s3AccessKeyId}:${signature}`,
-      'Date': date,
-      'Content-Type': contentType
+    const result: Record<string, string> = {
+      'Authorization': `AWS4-HMAC-SHA256 Credential=${this.config.s3AccessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`,
+      'x-amz-content-sha256': payloadHash,
+      'x-amz-date': amzDate,
     }
+    if (contentType) result['Content-Type'] = contentType
+    return result
   }
 }
 
@@ -293,6 +359,7 @@ class S3Storage implements StorageBackend {
 export interface Config {
   token: string
   commandTimeout: number
+  minAuthority: number
   debug: boolean
   storageType: 'local' | 'webdav' | 's3'
   storagePath?: string
@@ -321,6 +388,7 @@ export const Config: Schema<Config> = Schema.intersect([
   Schema.object({
     token: Schema.string().required().description('鉴权 Token，需与 Agent 端一致'),
     commandTimeout: Schema.number().default(15000).description('指令超时时间（毫秒）'),
+    minAuthority: Schema.number().default(3).description('使用监控命令所需的最低权限等级（0=不限制）'),
     debug: Schema.boolean().default(false).description('启用调试日志'),
     storageType: Schema.union(['local', 'webdav', 's3']).default('local').description('存储后端类型'),
   }),
@@ -374,6 +442,50 @@ function generateId(): string {
   return crypto.randomUUID()
 }
 
+// ── Security Helpers ──
+function escapeHtml(str: string): string {
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
+
+const DEVICE_ID_RE = /^[A-Za-z0-9_\u4e00-\u9fff-]{1,32}$/
+function isValidDeviceId(id: string): boolean {
+  return DEVICE_ID_RE.test(id)
+}
+
+// ── Rate Limiting ──
+const authAttempts = new Map<string, { count: number; resetAt: number }>()
+const MAX_AUTH_ATTEMPTS = 5
+const AUTH_WINDOW_MS = 60000 // 1 minute
+
+function checkRateLimit(ip: string): boolean {
+  const now = Date.now()
+  const entry = authAttempts.get(ip)
+  if (!entry || now > entry.resetAt) {
+    authAttempts.set(ip, { count: 1, resetAt: now + AUTH_WINDOW_MS })
+    return true
+  }
+  entry.count++
+  return entry.count <= MAX_AUTH_ATTEMPTS
+}
+
+function recordAuthFailure(ip: string) {
+  const now = Date.now()
+  const entry = authAttempts.get(ip)
+  if (!entry || now > entry.resetAt) {
+    authAttempts.set(ip, { count: 1, resetAt: now + AUTH_WINDOW_MS })
+  } else {
+    entry.count++
+  }
+}
+
+// Max WebSocket message size: 10 MB
+const MAX_WS_MESSAGE_SIZE = 10 * 1024 * 1024
+
 // ── Main Plugin ──
 export function apply(ctx: Context, config: Config) {
   const devices = new Map<string, DeviceConnection>()
@@ -418,10 +530,22 @@ export function apply(ctx: Context, config: Config) {
     timestamp: 'timestamp',
   }, { autoInc: true })
 
+  ctx.model.extend('monitorluna_icon', {
+    id: 'unsigned',
+    process: 'string',
+    iconBase64: 'text',
+  }, { autoInc: true, unique: [['process']] })
+
   // Initialize storage
   if (config.storageType === 'local') storage = new LocalStorage(ctx, config)
   else if (config.storageType === 'webdav') storage = new WebDAVStorage(config)
   else storage = new S3Storage(config)
+
+  // Timer references for cleanup on dispose
+  let cleanupTimer: ReturnType<typeof setInterval>
+  let screenshotTimer: ReturnType<typeof setInterval>
+  let summaryTimer: ReturnType<typeof setInterval>
+  let lastSummaryDate = ''
 
   ctx.on('ready', async () => {
     await storage.init()
@@ -431,15 +555,35 @@ export function apply(ctx: Context, config: Config) {
   })
 
   ctx.on('dispose', () => {
+    if (cleanupTimer) clearInterval(cleanupTimer)
+    if (screenshotTimer) clearInterval(screenshotTimer)
+    if (summaryTimer) clearInterval(summaryTimer)
+    for (const device of devices.values()) {
+      device.ws.close(1000, 'plugin disposed')
+      for (const pending of device.pendingCommands.values()) {
+        clearTimeout(pending.timer)
+        pending.reject(new Error('插件已卸载'))
+      }
+    }
+    devices.clear()
   })
 
   // WebSocket handler
   ctx.server.ws('/monitorluna', (ws: WebSocket, req: IncomingMessage) => {
     let deviceId: string | null = null
     let device: DeviceConnection | null = null
+    const clientIp = req.socket.remoteAddress || 'unknown'
 
     ws.on('message', (raw) => {
-      let msg: any
+      // Message size limit
+      const rawBytes = typeof raw === 'string' ? Buffer.byteLength(raw) : (raw as Buffer).length
+      if (rawBytes > MAX_WS_MESSAGE_SIZE) {
+        ctx.logger.warn(`[monitorluna] 消息过大 (${rawBytes} bytes), 来自 ${clientIp}`)
+        ws.close(1009, 'message too large')
+        return
+      }
+
+      let msg: Record<string, unknown>
       try {
         msg = JSON.parse(raw.toString())
       } catch {
@@ -448,12 +592,37 @@ export function apply(ctx: Context, config: Config) {
       }
 
       if (msg.type === 'hello') {
+        // Rate limit check
+        if (!checkRateLimit(clientIp)) {
+          ws.send(JSON.stringify({ type: 'error', message: 'too many attempts, try again later' }))
+          ws.close(1008, 'rate limited')
+          return
+        }
+
         if (msg.token !== config.token) {
+          recordAuthFailure(clientIp)
           ws.send(JSON.stringify({ type: 'error', message: 'invalid token' }))
           ws.close(1008, 'invalid token')
           return
         }
-        deviceId = String(msg.device_id || 'unknown')
+
+        const rawDeviceId = String(msg.device_id || 'unknown')
+        if (!isValidDeviceId(rawDeviceId)) {
+          ws.send(JSON.stringify({ type: 'error', message: 'invalid device_id format' }))
+          ws.close(1008, 'invalid device_id')
+          return
+        }
+        deviceId = rawDeviceId
+        // Close old connection for same device_id to prevent WS leak
+        const oldDevice = devices.get(deviceId)
+        if (oldDevice && oldDevice.ws !== ws) {
+          for (const pending of oldDevice.pendingCommands.values()) {
+            clearTimeout(pending.timer)
+            pending.reject(new Error('设备重连，旧连接已关闭'))
+          }
+          oldDevice.pendingCommands.clear()
+          oldDevice.ws.close(1000, 'replaced by new connection')
+        }
         device = { ws, deviceId, pendingCommands: new Map() }
         devices.set(deviceId, device)
         ctx.logger.info(`[monitorluna] 设备上线: ${deviceId}`)
@@ -481,12 +650,23 @@ export function apply(ctx: Context, config: Config) {
 
       if (msg.type === 'browser_activity') {
         // Browser extension authenticates via token in the message (not WebSocket handshake)
+        if (!checkRateLimit(clientIp)) {
+          ws.send(JSON.stringify({ type: 'error', message: 'too many attempts' }))
+          ws.close(1008, 'rate limited')
+          return
+        }
         if (msg.token !== config.token) {
+          recordAuthFailure(clientIp)
           ws.send(JSON.stringify({ type: 'error', message: 'invalid token' }))
           ws.close(1008, 'invalid token')
           return
         }
         const browserDeviceId = String(msg.device_id || 'unknown')
+        if (!isValidDeviceId(browserDeviceId)) {
+          ws.send(JSON.stringify({ type: 'error', message: 'invalid device_id format' }))
+          ws.close(1008, 'invalid device_id')
+          return
+        }
         handleBrowserActivity(browserDeviceId, msg).catch(e => ctx.logger.warn(`[monitorluna] 处理浏览器活动失败: ${e.message}`))
         return
       }
@@ -497,20 +677,24 @@ export function apply(ctx: Context, config: Config) {
       }
 
       if (msg.type === 'result' && msg.id) {
-        const pending = device.pendingCommands.get(msg.id)
+        const pending = device.pendingCommands.get(String(msg.id))
         if (pending) {
           clearTimeout(pending.timer)
-          device.pendingCommands.delete(msg.id)
-          if (msg.ok) pending.resolve(msg.data)
-          else pending.reject(new Error(msg.error || 'unknown error'))
+          device.pendingCommands.delete(String(msg.id))
+          if (msg.ok) pending.resolve(String(msg.data))
+          else pending.reject(new Error(String(msg.error || 'unknown error')))
         }
       }
     })
 
     ws.on('close', () => {
       if (deviceId) {
-        devices.delete(deviceId)
-        ctx.logger.info(`[monitorluna] 设备下线: ${deviceId}`)
+        // Only delete if the current mapping still points to this ws (race condition fix)
+        const current = devices.get(deviceId)
+        if (current && current.ws === ws) {
+          devices.delete(deviceId)
+          ctx.logger.info(`[monitorluna] 设备下线: ${deviceId}`)
+        }
         if (device) {
           for (const pending of device.pendingCommands.values()) {
             clearTimeout(pending.timer)
@@ -540,9 +724,9 @@ export function apply(ctx: Context, config: Config) {
     })
   }
 
-  async function handleActivity(deviceId: string, msg: any) {
-    const process = msg.process
-    const title = msg.title
+  async function handleActivity(deviceId: string, msg: Record<string, unknown>) {
+    const process = String(msg.process || '')
+    const title = String(msg.title || '')
     const afk: boolean = msg.afk === true
     if (config.debug) ctx.logger.info(`[monitorluna][debug] activity: device=${deviceId}, process=${process}, title=${title}, afk=${afk}`)
     try {
@@ -570,34 +754,49 @@ export function apply(ctx: Context, config: Config) {
     }
   }
 
-  async function handleInputStats(deviceId: string, msg: any) {
-    const stats = msg.stats
+  async function handleInputStats(deviceId: string, msg: Record<string, unknown>) {
+    const stats = msg.stats as Record<string, Record<string, unknown>> | undefined
     if (!stats) return
+    // Limit number of apps per message
+    const entries = Object.entries(stats).slice(0, 50)
     if (config.debug) ctx.logger.info(`[monitorluna][debug] input_stats: device=${deviceId}, apps=${Object.keys(stats).length}`)
     try {
       const now = new Date()
-      const rows = (Object.entries(stats) as [string, any][]).map(([process, data]) => ({
-        deviceId,
-        process,
-        displayName: data.display_name || process,
-        iconBase64: data.icon_base64 || '',
-        keyPresses: data.key_presses || 0,
-        leftClicks: data.left_clicks || 0,
-        rightClicks: data.right_clicks || 0,
-        scrollDistance: data.scroll_distance || 0,
-        timestamp: now
-      }))
+      const iconRows: Array<{ process: string; iconBase64: string }> = []
+      const rows = entries.map(([process, data]) => {
+        // Validate icon: must be valid base64 and under 10KB
+        const iconRaw = String(data.icon_base64 || '')
+        if (iconRaw && /^[A-Za-z0-9+/=]{1,14000}$/.test(iconRaw)) {
+          iconRows.push({ process, iconBase64: iconRaw })
+        }
+        return {
+          deviceId,
+          process,
+          displayName: String(data.display_name || process),
+          iconBase64: '',
+          keyPresses: Number(data.key_presses) || 0,
+          leftClicks: Number(data.left_clicks) || 0,
+          rightClicks: Number(data.right_clicks) || 0,
+          scrollDistance: Number(data.scroll_distance) || 0,
+          timestamp: now
+        }
+      })
       if (rows.length > 0) {
         await ctx.database.upsert('monitorluna_input_stats', rows)
+      }
+      if (iconRows.length > 0) {
+        await ctx.database.upsert('monitorluna_icon', iconRows, ['process'])
       }
     } catch (e) {
       ctx.logger.warn(`[monitorluna] 记录输入统计失败: ${e instanceof Error ? e.message : String(e)}`)
     }
   }
 
-  async function handleBrowserActivity(browserDeviceId: string, msg: any) {
-    const stats = msg.stats
+  async function handleBrowserActivity(browserDeviceId: string, msg: Record<string, unknown>) {
+    const stats = msg.stats as Record<string, unknown> | undefined
     if (!stats || typeof stats !== 'object') return
+    // Limit number of domains per message to prevent abuse
+    const domains = Object.entries(stats).slice(0, 100)
     if (config.debug) ctx.logger.info(`[monitorluna][debug] browser_activity: device=${browserDeviceId}, domains=${Object.keys(stats).length}`)
     try {
       const today = new Date()
@@ -605,7 +804,7 @@ export function apply(ctx: Context, config: Config) {
       const tomorrow = new Date(today)
       tomorrow.setDate(tomorrow.getDate() + 1)
 
-      for (const [domain, duration] of Object.entries(stats)) {
+      for (const [domain, duration] of domains) {
         if (typeof duration !== 'number' || duration <= 0) continue
         const existing = await ctx.database.get('monitorluna_browser_activity', {
           deviceId: browserDeviceId,
@@ -631,12 +830,12 @@ export function apply(ctx: Context, config: Config) {
   }
 
   function startPeriodicScreenshot() {
-    setInterval(async () => {
+    screenshotTimer = setInterval(async () => {
       for (const [deviceId] of devices) {
         try {
           const data = await sendCommand(deviceId, 'screenshot')
           const buf = Buffer.from(data, 'base64')
-          const filename = `${deviceId}_${Date.now()}.jpg`
+          const filename = `${crypto.randomUUID()}.jpg`
           const { url } = await storage.upload(buf, filename)
           await ctx.database.create('monitorluna_screenshot', {
             deviceId,
@@ -652,19 +851,37 @@ export function apply(ctx: Context, config: Config) {
   }
 
   function startCleanupTimer() {
-    setInterval(() => {
-      storage.cleanup(config.imageRetentionDays).catch(e =>
-        ctx.logger.warn(`[monitorluna] 清理失败: ${e.message}`)
-      )
-    }, 86400000) // Daily
+    // Run immediately on startup, then every 24 hours
+    runCleanup()
+    cleanupTimer = setInterval(runCleanup, 86400000)
+  }
+
+  async function runCleanup() {
+    const days = config.imageRetentionDays
+    try {
+      // Clean storage files
+      await storage.cleanup(days)
+      // Clean old DB records (all tables)
+      const cutoff = new Date(Date.now() - days * 86400000)
+      await ctx.database.remove('monitorluna_screenshot', { timestamp: { $lt: cutoff } })
+      await ctx.database.remove('monitorluna_input_stats', { timestamp: { $lt: cutoff } })
+      await ctx.database.remove('monitorluna_activity', { timestamp: { $lt: cutoff } })
+      await ctx.database.remove('monitorluna_browser_activity', { timestamp: { $lt: cutoff } })
+    } catch (e) {
+      ctx.logger.warn(`[monitorluna] 清理失败: ${e instanceof Error ? e.message : String(e)}`)
+    }
   }
 
   function startDailySummary() {
     const [hour, minute] = config.dailySummaryTime.split(':').map(Number)
-    setInterval(() => {
+    summaryTimer = setInterval(() => {
       const now = new Date()
       if (now.getHours() === hour && now.getMinutes() === minute) {
-        generateDailySummary()
+        const dateKey = now.toISOString().slice(0, 10)
+        if (lastSummaryDate !== dateKey) {
+          lastSummaryDate = dateKey
+          generateDailySummary()
+        }
       }
     }, 60000)
   }
@@ -694,11 +911,16 @@ export function apply(ctx: Context, config: Config) {
       const clip = body ? await body.boundingBox() : null
       const buf = await page.screenshot({ clip, type: 'jpeg', quality: 90 })
       await page.close()
-      const filename = `summary_${target.deviceId}_${Date.now()}.jpg`
+      const filename = `summary_${crypto.randomUUID()}.jpg`
       const { url } = await storage.upload(buf, filename)
 
       for (const channelId of target.channelIds) {
-        const [platform, selfId, gid] = channelId.split(':')
+        const parts = channelId.split(':')
+        if (parts.length < 3) {
+          ctx.logger.warn(`[monitorluna] 无效的 channelId 格式: ${channelId}，应为 platform:selfId:gid`)
+          continue
+        }
+        const [platform, selfId, gid] = parts
         await ctx.bots[`${platform}:${selfId}`]?.sendMessage(gid, h.image(url))
       }
     }
@@ -729,12 +951,14 @@ export function apply(ctx: Context, config: Config) {
     // 浏览器进程名称集合
     const BROWSER_PROCESSES = new Set(['chrome.exe', 'msedge.exe', 'firefox.exe', 'brave.exe', 'opera.exe'])
 
-    // 构建图标映射
+    // 构建图标映射（从独立的图标表查询）
+    const allProcesses = [...new Set(inputStats.map(r => r.process))]
+    const iconRecords = allProcesses.length > 0
+      ? await ctx.database.get('monitorluna_icon', { process: { $in: allProcesses } })
+      : []
     const iconMap = new Map<string, string>()
-    for (const record of inputStats) {
-      if (record.iconBase64 && !iconMap.has(record.process)) {
-        iconMap.set(record.process, record.iconBase64)
-      }
+    for (const record of iconRecords) {
+      iconMap.set(record.process, record.iconBase64)
     }
 
     // 聚合输入统计
@@ -763,12 +987,13 @@ export function apply(ctx: Context, config: Config) {
     const maxClicks = Math.max(...topInputApps.map(([, s]) => s.clicks), 1)
     const maxScroll = Math.max(...topInputApps.map(([, s]) => s.scrollDistance), 1)
 
-    // 过滤 AFK 记录，计算实际活跃时间
+    // 过滤 AFK 记录，计算实际活跃时间（单条记录上限 30 分钟）
+    const MAX_RECORD_MS = 30 * 60 * 1000
     const activeRecords = records.filter(r => !r.afk)
     const totalActiveMs = records.reduce((sum, r) => {
       if (r.afk) return sum
       const end = r.endTime ? r.endTime.getTime() : r.timestamp.getTime()
-      return sum + Math.max(0, end - r.timestamp.getTime())
+      return sum + Math.min(MAX_RECORD_MS, Math.max(0, end - r.timestamp.getTime()))
     }, 0)
     const totalActiveMinutes = Math.round(totalActiveMs / 1000 / 60)
 
@@ -782,7 +1007,7 @@ export function apply(ctx: Context, config: Config) {
     for (const record of records) {
       if (record.afk) continue
       const end = record.endTime ? record.endTime.getTime() : record.timestamp.getTime()
-      const duration = Math.max(0, end - record.timestamp.getTime()) / 1000 / 60 // 分钟
+      const duration = Math.min(30, Math.max(0, end - record.timestamp.getTime()) / 1000 / 60) // 分钟，上限30
       if (duration <= 0) continue
       const hour = record.timestamp.getHours()
       const processMap = hourlyStats.get(hour)!
@@ -795,7 +1020,7 @@ export function apply(ctx: Context, config: Config) {
     for (const record of records) {
       if (record.afk) continue
       const end = record.endTime ? record.endTime.getTime() : record.timestamp.getTime()
-      const duration = Math.max(0, end - record.timestamp.getTime()) / 1000 / 60
+      const duration = Math.min(30, Math.max(0, end - record.timestamp.getTime()) / 1000 / 60)
       const hour = record.timestamp.getHours()
       hourlyActivity.set(hour, (hourlyActivity.get(hour) || 0) + duration)
     }
@@ -826,7 +1051,7 @@ export function apply(ctx: Context, config: Config) {
     const afkMinutes = Math.round(records.reduce((sum, r) => {
       if (!r.afk) return sum
       const end = r.endTime ? r.endTime.getTime() : r.timestamp.getTime()
-      return sum + Math.max(0, end - r.timestamp.getTime())
+      return sum + Math.min(MAX_RECORD_MS, Math.max(0, end - r.timestamp.getTime()))
     }, 0) / 1000 / 60)
 
     return `<!DOCTYPE html>
@@ -884,7 +1109,7 @@ body{font-family:var(--font-body);color:var(--ink-primary);background-color:var(
 <div class="date-badge">${date}</div>
 </div>
 </div>
-<div style="text-align:center;color:var(--ink-secondary);margin-bottom:30px;font-family:var(--font-hand)">设备: ${deviceId} · 统计时段: ${startHour}:00 - ${endHour}:59 · 实际活跃: ${totalActiveMinutes}分钟 · AFK: ${afkMinutes}分钟</div>
+<div style="text-align:center;color:var(--ink-secondary);margin-bottom:30px;font-family:var(--font-hand)">设备: ${escapeHtml(deviceId)} · 统计时段: ${startHour}:00 - ${endHour}:59 · 实际活跃: ${totalActiveMinutes}分钟 · AFK: ${afkMinutes}分钟</div>
 <div class="section">
 <div class="section-title">📊 24H 活跃轨迹</div>
 <div class="chart-box">
@@ -913,12 +1138,14 @@ ${topInputApps.map(([process, stats], idx) => {
       const keysInside = keysW > 30
       const clicksInside = clicksW > 30
       const scrollInside = scrollW > 30
+      // Validate icon: must be valid base64 PNG, limit length
+      const safeIcon = stats.icon && /^[A-Za-z0-9+/=]{1,10000}$/.test(stats.icon) ? stats.icon : ''
       return `<div class="input-stats-item">
 <div class="app-row">
   <div class="app-info">
     <span style="color:var(--ink-secondary);font-size:0.8rem;min-width:16px">${idx + 1}</span>
-    ${stats.icon ? `<img src="data:image/png;base64,${stats.icon}" class="app-icon">` : '<div style="width:16px"></div>'}
-    <span class="app-name">${formatAppName(process)}</span>
+    ${safeIcon ? `<img src="data:image/png;base64,${safeIcon}" class="app-icon">` : '<div style="width:16px"></div>'}
+    <span class="app-name">${escapeHtml(formatAppName(process))}</span>
   </div>
   <div class="bar-col">
     <div class="bar-track"><div class="bar-fill-keys" style="width:${keysW}%">${keysInside ? `<span class="bar-text">${stats.keyPresses.toLocaleString()}</span>` : ''}</div>${!keysInside ? `<span style="position:absolute;right:4px;top:50%;transform:translateY(-50%);font-size:10px;font-weight:600;color:#888">${stats.keyPresses.toLocaleString()}</span>` : ''}</div>
@@ -942,8 +1169,9 @@ ${Array.from(hourlyTop4.entries()).filter(([, top]) => top.length > 0).map(([hou
 <div class="hour-list">
 ${top.map(([app, dur]) => {
       const icon = iconMap.get(app)
-      const iconHtml = icon ? `<img src="data:image/png;base64,${icon}" style="width:14px;height:14px;margin-right:3px;vertical-align:middle">` : ''
-      return `<span class="hour-tag"><span class="hour-tag-name">${iconHtml}${formatAppName(app)}</span><span class="hour-tag-time">${Math.round(dur)}m</span></span>`
+      const safeIcon = icon && /^[A-Za-z0-9+/=]{1,10000}$/.test(icon) ? icon : ''
+      const iconHtml = safeIcon ? `<img src="data:image/png;base64,${safeIcon}" style="width:14px;height:14px;margin-right:3px;vertical-align:middle">` : ''
+      return `<span class="hour-tag"><span class="hour-tag-name">${iconHtml}${escapeHtml(formatAppName(app))}</span><span class="hour-tag-time">${Math.round(dur)}m</span></span>`
     }).join('')}
 </div>
 </div>`).join('')}
@@ -957,7 +1185,7 @@ ${[...browserDomainMap.entries()]
   .slice(0, 5)
   .map(([domain, secs], i) => {
     const mins = Math.round(secs / 60)
-    return `<div class="list-item"><span class="item-name">${i + 1}. ${domain}</span><span class="item-value">${mins} 分钟</span></div>`
+    return `<div class="list-item"><span class="item-name">${i + 1}. ${escapeHtml(domain)}</span><span class="item-value">${mins} 分钟</span></div>`
   }).join('')}
 </div>
 </div>` : ''}
@@ -968,14 +1196,26 @@ ${[...browserDomainMap.entries()]
   // Bot commands
   const monitor = ctx.command('monitor', '远程设备监控')
 
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- session.user.authority requires auth plugin types
+  function checkAuth(session: any): string | void {
+    if (config.minAuthority > 0) {
+      const auth = session?.user?.authority ?? 0
+      if (auth < config.minAuthority) return '权限不足（需要管理员权限）'
+    }
+  }
+
   monitor.subcommand('.list', '列出所有在线设备')
-    .action(() => {
+    .action(({ session }) => {
+      const denied = checkAuth(session)
+      if (denied) return denied
       if (devices.size === 0) return '当前没有在线设备'
       return '在线设备：\n' + [...devices.keys()].map(id => `• ${id}`).join('\n')
     })
 
   monitor.subcommand('.screen <device:string>', '截取远程设备屏幕')
     .action(async ({ session }, device) => {
+      const denied = checkAuth(session)
+      if (denied) return denied
       if (!device) return '请指定设备名称'
       try {
         const data = await sendCommand(device, 'screenshot')
@@ -988,6 +1228,8 @@ ${[...browserDomainMap.entries()]
 
   monitor.subcommand('.window <device:string>', '截取远程设备当前活跃窗口')
     .action(async ({ session }, device) => {
+      const denied = checkAuth(session)
+      if (denied) return denied
       if (!device) return '请指定设备名称'
       try {
         const data = await sendCommand(device, 'window_screenshot')
@@ -1000,6 +1242,8 @@ ${[...browserDomainMap.entries()]
 
   monitor.subcommand('.status <device:string>', '查看远程设备系统状态')
     .action(async ({ session }, device) => {
+      const denied = checkAuth(session)
+      if (denied) return denied
       if (!device) return '请指定设备名称'
       try {
         const data = await sendCommand(device, 'system_status')
@@ -1024,6 +1268,8 @@ ${[...browserDomainMap.entries()]
 
   monitor.subcommand('.analytics <device:string>', '生成当天活动总结')
     .action(async ({ session }, device) => {
+      const denied = checkAuth(session)
+      if (denied) return denied
       if (!device) return '请指定设备名称'
       const today = new Date()
       today.setHours(0, 0, 0, 0)
@@ -1053,7 +1299,7 @@ ${[...browserDomainMap.entries()]
         await page.close()
 
         if (config.debug) ctx.logger.info(`[monitorluna][debug] screenshot ok, buf size: ${buf.length}`)
-        const filename = `summary_${device}_${Date.now()}.jpg`
+        const filename = `summary_${crypto.randomUUID()}.jpg`
         const { url } = await storage.upload(buf, filename)
         if (config.debug) ctx.logger.info(`[monitorluna][debug] upload ok, url: ${url}`)
         return h.image(url)
@@ -1064,6 +1310,8 @@ ${[...browserDomainMap.entries()]
 
   monitor.subcommand('.browser <device:string>', '查看今日浏览器域名时长排行')
     .action(async ({ session }, device) => {
+      const denied = checkAuth(session)
+      if (denied) return denied
       if (!device) return '请指定设备名称'
       const today = new Date()
       today.setHours(0, 0, 0, 0)

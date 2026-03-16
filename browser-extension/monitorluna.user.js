@@ -38,16 +38,37 @@
 
     const newUrl = prompt('WebSocket 服务器地址：', curUrl);
     if (newUrl === null) return;
+
+    const trimmedUrl = newUrl.trim();
+    if (!trimmedUrl.startsWith('ws://') && !trimmedUrl.startsWith('wss://')) {
+      alert('地址必须以 ws:// 或 wss:// 开头');
+      return;
+    }
+    if (trimmedUrl.startsWith('ws://')) {
+      try {
+        const parsed = new URL(trimmedUrl);
+        const host = parsed.hostname;
+        if (host !== 'localhost' && host !== '127.0.0.1') {
+          alert('⚠️ 非本地地址建议使用 wss:// 加密连接，当前使用的是不安全的 ws:// 协议');
+        }
+      } catch {}
+    }
+
     const newToken = prompt('Token（与 Koishi 配置一致）：', curToken);
     if (newToken === null) return;
     const newDevice = prompt('Device ID：', curDevice || location.hostname);
     if (newDevice === null) return;
 
-    GM_setValue(CFG_URL,    newUrl.trim());
+    if (!/^[A-Za-z0-9_\u4e00-\u9fff-]{1,32}$/.test(newDevice.trim())) {
+      alert('设备ID仅允许字母、数字、下划线、中文和连字符，最长32位');
+      return;
+    }
+
+    GM_setValue(CFG_URL,    trimmedUrl);
     GM_setValue(CFG_TOKEN,  newToken.trim());
     GM_setValue(CFG_DEVICE, newDevice.trim());
 
-    wsUrl    = newUrl.trim();
+    wsUrl    = trimmedUrl;
     token    = newToken.trim();
     deviceId = newDevice.trim();
 

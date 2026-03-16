@@ -43,6 +43,27 @@ document.getElementById('save').addEventListener('click', async () => {
     return;
   }
 
+  if (!url.startsWith('ws://') && !url.startsWith('wss://')) {
+    showToast('地址必须以 ws:// 或 wss:// 开头', false);
+    return;
+  }
+
+  if (url.startsWith('ws://')) {
+    try {
+      const parsed = new URL(url);
+      const host = parsed.hostname;
+      if (host !== 'localhost' && host !== '127.0.0.1') {
+        showToast('非本地地址建议使用 wss:// 加密连接', false);
+        return;
+      }
+    } catch {}
+  }
+
+  if (!/^[A-Za-z0-9_\u4e00-\u9fff-]{1,32}$/.test(deviceId)) {
+    showToast('设备ID仅允许字母、数字、下划线、中文和连字符，最长32位', false);
+    return;
+  }
+
   await chrome.storage.local.set({ url, token, deviceId });
   chrome.runtime.sendMessage({ type: 'config_updated' });
   showToast('已保存，正在连接...', true);

@@ -72,6 +72,13 @@ function connect() {
   }
 
   try {
+    const parsed = new URL(config.url);
+    if (parsed.protocol === 'ws:' && parsed.hostname !== 'localhost' && parsed.hostname !== '127.0.0.1') {
+      console.warn('[MonitorLuna] 当前使用未加密的 ws:// 连接到非本地地址 (' + parsed.hostname + ')，建议使用 wss:// 以保障数据安全');
+    }
+  } catch {}
+
+  try {
     ws = new WebSocket(config.url);
   } catch {
     wsConnected = false;

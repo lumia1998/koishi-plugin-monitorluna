@@ -8,6 +8,7 @@ import base64
 import io
 import json
 import os
+import random
 import sys
 import threading
 import time
@@ -196,8 +197,8 @@ if IS_WINDOWS and WINDOWS_FEATURES:
             while windll.user32.GetMessageW(byref(msg), None, 0, 0) != 0:
                 windll.user32.TranslateMessage(byref(msg))
                 windll.user32.DispatchMessageW(byref(msg))
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"Warning: input hook thread exception: {e}", flush=True)
         finally:
             if _keyboard_hook:
                 windll.user32.UnhookWindowsHookEx(_keyboard_hook)
@@ -308,9 +309,15 @@ def extract_icon_base64(process_name: str) -> str:
 
 
 def get_input_stats_snapshot() -> dict:
-    """返回当前输入统计快照，并为每个应用添加图标"""
+    """返回当前输入统计快照并重置计数器"""
     with _input_stats_lock:
         snapshot = {k: dict(v) for k, v in _app_stats.items()}
+        # 重置所有计数器（保留 app 条目和 display_name）
+        for stats in _app_stats.values():
+            stats["key_presses"] = 0
+            stats["left_clicks"] = 0
+            stats["right_clicks"] = 0
+            stats["scroll_distance"] = 0.0
     result = {}
     for process_name, stats in snapshot.items():
         icon = extract_icon_base64(process_name)
@@ -487,8 +494,9 @@ class MonitorLunaAgent:
             await self._run_once()
             if not self.running:
                 break
-            self.status = f"重连中... ({delay}s 后)"
-            await asyncio.sleep(delay)
+            actual_delay = delay * (0.5 + random.random())  # 50%-150% of delay
+            self.status = f"重连中... ({actual_delay:.1f}s 后)"
+            await asyncio.sleep(actual_delay)
             delay = min(delay * 2, 60)
 
     def start_in_thread(self):
@@ -588,15 +596,70 @@ async def handle_index(request):
 
 async def handle_get_config(request):
     agent = request.app["agent"]
-    return web.json_response(agent.config)
+    safe_config = {**agent.config, "token": "***" if agent.config.get("token") else ""}
+    return web.json_response(safe_config)
+
+
+ALLOWED_CONFIG_FIELDS = {"url", "token", "device_id"}
+WEAK_TOKENS = {"", "admin", "123456", "password", "token", "test", "1234"}
+
+
+def _is_localhost_origin(request) -> bool:
+    """Check Origin or Referer header to ensure request comes from localhost."""
+    origin = request.headers.get("Origin", "")
+    referer = request.headers.get("Referer", "")
+    localhost_prefixes = (
+        "http://127.0.0.1", "http://localhost",
+        "https://127.0.0.1", "https://localhost",
+    )
+    if origin:
+        return any(origin.startswith(p) for p in localhost_prefixes)
+    if referer:
+        return any(referer.startswith(p) for p in localhost_prefixes)
+    # No Origin/Referer at all -- reject (browsers always send these on POST)
+    return False
+
+
+def _validate_config(data: dict) -> str | None:
+    """Validate config data. Returns error message or None if valid."""
+    if not isinstance(data, dict):
+        return "Config must be a JSON object"
+    # Reject unknown fields
+    unknown = set(data.keys()) - ALLOWED_CONFIG_FIELDS
+    if unknown:
+        return f"Unknown config fields: {', '.join(sorted(unknown))}"
+    # Validate url
+    url = data.get("url", "")
+    if url and not url.startswith(("ws://", "wss://")):
+        return "URL must start with ws:// or wss://"
+    # Validate token
+    token = data.get("token", "")
+    if not token or not token.strip():
+        return "Token must not be empty"
+    if token.strip().lower() in WEAK_TOKENS:
+        return "Token is too weak; choose a stronger token"
+    return None
 
 
 async def handle_post_config(request):
     agent = request.app["agent"]
+    # Origin check: only allow requests from localhost
+    if not _is_localhost_origin(request):
+        return web.json_response({"ok": False, "error": "Forbidden: invalid origin"}, status=403)
     data = await request.json()
+    # Schema validation
+    error = _validate_config(data)
+    if error:
+        return web.json_response({"ok": False, "error": error}, status=400)
     save_config(data)
+    old_loop = agent._loop
     agent.stop()
-    await asyncio.sleep(0.5)
+    # 等待旧线程的 event loop 完全停止
+    if old_loop:
+        for _ in range(20):
+            if old_loop.is_closed() or not old_loop.is_running():
+                break
+            await asyncio.sleep(0.1)
     agent.config = data
     agent.running = True
     agent.start_in_thread()
