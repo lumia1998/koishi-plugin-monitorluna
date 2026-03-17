@@ -1,9 +1,10 @@
 import { Context, Schema, h } from 'koishi'
 import { IncomingMessage } from 'http'
 import { WebSocket } from 'ws'
-import { } from '@koishijs/plugin-server'
+import '@koishijs/plugin-server'
 import * as fs from 'fs/promises'
 import * as path from 'path'
+import * as crypto from 'crypto'
 
 export const name = 'monitorluna'
 
@@ -39,6 +40,7 @@ declare module 'koishi' {
     monitorluna_activity: ActivityLog
     monitorluna_screenshot: Screenshot
     monitorluna_input_stats: InputStats
+    monitorluna_icon: IconData
   }
 }
 
@@ -62,12 +64,17 @@ interface InputStats {
   deviceId: string
   process: string
   displayName: string
-  iconBase64: string
+  iconHash: string
   keyPresses: number
   leftClicks: number
   rightClicks: number
   scrollDistance: number
   timestamp: Date
+}
+
+interface IconData {
+  hash: string
+  data: string
 }
 
 // ── Storage Backend Interface ──
@@ -80,16 +87,24 @@ interface StorageBackend {
 
 // ── Local Storage ──
 class LocalStorage implements StorageBackend {
-  constructor(private ctx: Context, private config: Config) { }
+  private dir: string
+
+  constructor(private ctx: Context, private config: Config) {
+    this.dir = path.join(ctx.baseDir, config.storagePath || 'data/monitorluna')
+  }
 
   async init() {
-    const dir = path.join(this.ctx.baseDir, this.config.storagePath || 'data/monitorluna')
-    await fs.mkdir(dir, { recursive: true })
+    await fs.mkdir(this.dir, { recursive: true })
 
     // Mount HTTP route
     this.ctx.server.get('/monitorluna/:filename', async (ctx) => {
+      const filename = ctx.params.filename
+      if (filename.includes('..') || filename.includes('/') || filename.includes('\\')) {
+        ctx.status = 400
+        return
+      }
       try {
-        const file = path.join(dir, ctx.params.filename)
+        const file = path.join(this.dir, filename)
         const buf = await fs.readFile(file)
         ctx.type = 'image/jpeg'
         ctx.body = buf
@@ -100,24 +115,21 @@ class LocalStorage implements StorageBackend {
   }
 
   async upload(buffer: Buffer, filename: string) {
-    const dir = path.join(this.ctx.baseDir, this.config.storagePath || 'data/monitorluna')
-    const filepath = path.join(dir, filename)
+    const filepath = path.join(this.dir, filename)
     await fs.writeFile(filepath, buffer)
     const baseUrl = this.config.serverPath || 'http://127.0.0.1:5140'
     return { key: filename, url: `${baseUrl}/monitorluna/${filename}` }
   }
 
   async delete(key: string) {
-    const dir = path.join(this.ctx.baseDir, this.config.storagePath || 'data/monitorluna')
-    await fs.unlink(path.join(dir, key)).catch(() => { })
+    await fs.unlink(path.join(this.dir, key)).catch(() => { })
   }
 
   async cleanup(days: number) {
-    const dir = path.join(this.ctx.baseDir, this.config.storagePath || 'data/monitorluna')
     const cutoff = Date.now() - days * 86400000
-    const files = await fs.readdir(dir)
+    const files = await fs.readdir(this.dir)
     for (const file of files) {
-      const stat = await fs.stat(path.join(dir, file))
+      const stat = await fs.stat(path.join(this.dir, file))
       if (stat.mtimeMs < cutoff) await this.delete(file)
     }
   }
@@ -149,7 +161,32 @@ class WebDAVStorage implements StorageBackend {
   }
 
   async cleanup(days: number) {
-    // WebDAV cleanup requires listing - simplified: skip for now
+    const cutoff = Date.now() - days * 86400000
+    try {
+      const auth = Buffer.from(`${this.config.webdavUsername}:${this.config.webdavPassword}`).toString('base64')
+      const res = await fetch(this.config.webdavEndpoint, {
+        method: 'PROPFIND',
+        headers: {
+          'Authorization': `Basic ${auth}`,
+          'Depth': '1'
+        }
+      })
+      if (!res.ok) return
+
+      const xml = await res.text()
+      const hrefMatches = xml.matchAll(/<D:href>([^<]+)<\/D:href>/g)
+      const modifiedMatches = xml.matchAll(/<D:getlastmodified>([^<]+)<\/D:getlastmodified>/g)
+
+      const hrefs = [...hrefMatches].map(m => m[1]).slice(1) // Skip root
+      const dates = [...modifiedMatches].map(m => new Date(m[1]).getTime())
+
+      for (let i = 0; i < hrefs.length; i++) {
+        if (dates[i] < cutoff) {
+          const filename = hrefs[i].split('/').pop()
+          if (filename) await this.delete(filename)
+        }
+      }
+    } catch { }
   }
 }
 
@@ -161,7 +198,7 @@ class S3Storage implements StorageBackend {
 
   async upload(buffer: Buffer, filename: string) {
     const url = this.getUrl(filename)
-    const headers = await this.signRequest('PUT', filename, buffer)
+    const headers = await this.signRequestV4('PUT', filename, buffer)
     const res = await fetch(url, { method: 'PUT', headers, body: buffer as unknown as BodyInit })
     if (!res.ok) throw new Error(`S3 upload failed: ${res.status} ${res.statusText}`)
     const publicUrl = this.config.s3PublicUrl || url
@@ -170,11 +207,33 @@ class S3Storage implements StorageBackend {
 
   async delete(key: string) {
     const url = this.getUrl(key)
-    const headers = await this.signRequest('DELETE', key)
+    const headers = await this.signRequestV4('DELETE', key)
     await fetch(url, { method: 'DELETE', headers }).catch(() => { })
   }
 
-  async cleanup(days: number) { }
+  async cleanup(days: number) {
+    const cutoff = Date.now() - days * 86400000
+    try {
+      const listUrl = this.config.s3PathStyle
+        ? `${this.config.s3Endpoint}/${this.config.s3Bucket}?list-type=2`
+        : `${this.config.s3Endpoint.replace('://', `://${this.config.s3Bucket}.`)}?list-type=2`
+
+      const headers = await this.signRequestV4('GET', '', undefined, { 'list-type': '2' })
+      const res = await fetch(listUrl, { method: 'GET', headers })
+      if (!res.ok) return
+
+      const xml = await res.text()
+      const keyMatches = xml.matchAll(/<Key>(.*?)<\/Key>/g)
+      const modifiedMatches = xml.matchAll(/<LastModified>(.*?)<\/LastModified>/g)
+
+      const keys = [...keyMatches].map(m => m[1])
+      const dates = [...modifiedMatches].map(m => new Date(m[1]).getTime())
+
+      for (let i = 0; i < keys.length; i++) {
+        if (dates[i] < cutoff) await this.delete(keys[i])
+      }
+    } catch { }
+  }
 
   private getUrl(key: string) {
     const { s3Endpoint, s3Bucket, s3PathStyle } = this.config
@@ -183,21 +242,45 @@ class S3Storage implements StorageBackend {
     return `${s3Endpoint.replace('://', `://${s3Bucket}.`)}/${key}`
   }
 
-  private async signRequest(method: string, key: string, body?: Buffer) {
-    const date = new Date().toUTCString()
-    const contentType = 'image/jpeg'
-    const resource = `/${this.config.s3Bucket}/${key}`
-    const stringToSign = `${method}\n\n${contentType}\n${date}\n${resource}`
+  private async signRequestV4(method: string, key: string, body?: Buffer, queryParams?: Record<string, string>) {
+    const now = new Date()
+    const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, '')
+    const dateStamp = amzDate.slice(0, 8)
+    const region = this.config.s3Region || 'us-east-1'
+    const service = 's3'
 
-    const crypto = await import('crypto')
-    const secret = this.config.s3SecretAccessKey || ''
-    const signature = crypto.createHmac('sha1', secret)
-      .update(stringToSign).digest('base64')
+    const host = this.config.s3PathStyle
+      ? new URL(this.config.s3Endpoint).host
+      : `${this.config.s3Bucket}.${new URL(this.config.s3Endpoint).host}`
+
+    const canonicalUri = this.config.s3PathStyle ? `/${this.config.s3Bucket}/${key}` : `/${key}`
+    const canonicalQuerystring = queryParams
+      ? Object.entries(queryParams).sort().map(([k, v]) => `${k}=${v}`).join('&')
+      : ''
+
+    const payloadHash = crypto.createHash('sha256').update(body || '').digest('hex')
+    const canonicalHeaders = `host:${host}\nx-amz-content-sha256:${payloadHash}\nx-amz-date:${amzDate}\n`
+    const signedHeaders = 'host;x-amz-content-sha256;x-amz-date'
+
+    const canonicalRequest = `${method}\n${canonicalUri}\n${canonicalQuerystring}\n${canonicalHeaders}\n${signedHeaders}\n${payloadHash}`
+    const canonicalRequestHash = crypto.createHash('sha256').update(canonicalRequest).digest('hex')
+
+    const credentialScope = `${dateStamp}/${region}/${service}/aws4_request`
+    const stringToSign = `AWS4-HMAC-SHA256\n${amzDate}\n${credentialScope}\n${canonicalRequestHash}`
+
+    const kDate = crypto.createHmac('sha256', `AWS4${this.config.s3SecretAccessKey}`).update(dateStamp).digest()
+    const kRegion = crypto.createHmac('sha256', kDate).update(region).digest()
+    const kService = crypto.createHmac('sha256', kRegion).update(service).digest()
+    const kSigning = crypto.createHmac('sha256', kService).update('aws4_request').digest()
+    const signature = crypto.createHmac('sha256', kSigning).update(stringToSign).digest('hex')
+
+    const authorization = `AWS4-HMAC-SHA256 Credential=${this.config.s3AccessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`
 
     return {
-      'Authorization': `AWS ${this.config.s3AccessKeyId}:${signature}`,
-      'Date': date,
-      'Content-Type': contentType
+      'Authorization': authorization,
+      'x-amz-date': amzDate,
+      'x-amz-content-sha256': payloadHash,
+      'Content-Type': 'image/jpeg'
     }
   }
 }
@@ -308,12 +391,17 @@ export function apply(ctx: Context, config: Config) {
     timestamp: 'timestamp'
   }, { autoInc: true })
 
+  ctx.model.extend('monitorluna_icon', {
+    hash: 'string',
+    data: 'text'
+  }, { primary: 'hash' })
+
   ctx.model.extend('monitorluna_input_stats', {
     id: 'unsigned',
     deviceId: 'string',
     process: 'string',
     displayName: 'string',
-    iconBase64: 'text',
+    iconHash: 'string',
     keyPresses: 'unsigned',
     leftClicks: 'unsigned',
     rightClicks: 'unsigned',
@@ -326,14 +414,18 @@ export function apply(ctx: Context, config: Config) {
   else if (config.storageType === 'webdav') storage = new WebDAVStorage(config)
   else storage = new S3Storage(config)
 
+  const timers: ReturnType<typeof setInterval>[] = []
+
   ctx.on('ready', async () => {
     await storage.init()
-    startCleanupTimer()
-    startPeriodicScreenshot()
-    if (config.dailySummaryEnabled) startDailySummary()
+    timers.push(startCleanupTimer())
+    timers.push(startPeriodicScreenshot())
+    if (config.dailySummaryEnabled) timers.push(startDailySummary())
   })
 
   ctx.on('dispose', () => {
+    for (const timer of timers) clearInterval(timer)
+    timers.length = 0
   })
 
   // WebSocket handler
@@ -369,7 +461,7 @@ export function apply(ctx: Context, config: Config) {
           ws.close(1008, 'not authenticated')
           return
         }
-        handleActivity(msg).catch(e => ctx.logger.warn(`[monitorluna] 处理活动失败: ${e.message}`))
+        handleActivity(deviceId, msg).catch(e => ctx.logger.warn(`[monitorluna] 处理活动失败: ${e.message}`))
         return
       }
 
@@ -378,7 +470,7 @@ export function apply(ctx: Context, config: Config) {
           ws.close(1008, 'not authenticated')
           return
         }
-        handleInputStats(msg).catch(e => ctx.logger.warn(`[monitorluna] 处理输入统计失败: ${e.message}`))
+        handleInputStats(deviceId, msg).catch(e => ctx.logger.warn(`[monitorluna] 处理输入统计失败: ${e.message}`))
         return
       }
 
@@ -431,8 +523,7 @@ export function apply(ctx: Context, config: Config) {
     })
   }
 
-  async function handleActivity(msg: any) {
-    if (!deviceId) return
+  async function handleActivity(deviceId: string, msg: any) {
     const process = msg.process
     const title = msg.title
     if (config.debug) ctx.logger.info(`[monitorluna][debug] activity: device=${deviceId}, process=${process}, title=${title}`)
@@ -448,34 +539,43 @@ export function apply(ctx: Context, config: Config) {
     }
   }
 
-  async function handleInputStats(msg: any) {
-    if (!deviceId) return
+  async function handleInputStats(deviceId: string, msg: any) {
     const stats = msg.stats
     if (!stats) return
     if (config.debug) ctx.logger.info(`[monitorluna][debug] input_stats: device=${deviceId}, apps=${Object.keys(stats).length}`)
     try {
       const now = new Date()
-      const rows = (Object.entries(stats) as [string, any][]).map(([process, data]) => ({
-        deviceId,
-        process,
-        displayName: data.display_name || process,
-        iconBase64: data.icon_base64 || '',
-        keyPresses: data.key_presses || 0,
-        leftClicks: data.left_clicks || 0,
-        rightClicks: data.right_clicks || 0,
-        scrollDistance: data.scroll_distance || 0,
-        timestamp: now
-      }))
-      for (const row of rows) {
-        await ctx.database.create('monitorluna_input_stats', row)
+      const iconUpdates: IconData[] = []
+      const rows = (Object.entries(stats) as [string, any][]).map(([process, data]) => {
+        let iconHash = ''
+        if (data.icon_base64) {
+          iconHash = crypto.createHash('md5').update(data.icon_base64).digest('hex')
+          iconUpdates.push({ hash: iconHash, data: data.icon_base64 })
+        }
+        return {
+          deviceId,
+          process,
+          displayName: data.display_name || process,
+          iconHash,
+          keyPresses: data.key_presses || 0,
+          leftClicks: data.left_clicks || 0,
+          rightClicks: data.right_clicks || 0,
+          scrollDistance: data.scroll_distance || 0,
+          timestamp: now
+        }
+      })
+
+      if (iconUpdates.length > 0) {
+        await ctx.database.upsert('monitorluna_icon', iconUpdates)
       }
+      await ctx.database.create('monitorluna_input_stats', rows)
     } catch (e) {
       ctx.logger.warn(`[monitorluna] 记录输入统计失败: ${e instanceof Error ? e.message : String(e)}`)
     }
   }
 
   function startPeriodicScreenshot() {
-    setInterval(async () => {
+    return setInterval(async () => {
       for (const [deviceId] of devices) {
         try {
           const data = await sendCommand(deviceId, 'screenshot')
@@ -496,7 +596,7 @@ export function apply(ctx: Context, config: Config) {
   }
 
   function startCleanupTimer() {
-    setInterval(() => {
+    return setInterval(() => {
       storage.cleanup(config.imageRetentionDays).catch(e =>
         ctx.logger.warn(`[monitorluna] 清理失败: ${e.message}`)
       )
@@ -505,7 +605,7 @@ export function apply(ctx: Context, config: Config) {
 
   function startDailySummary() {
     const [hour, minute] = config.dailySummaryTime.split(':').map(Number)
-    setInterval(() => {
+    return setInterval(() => {
       const now = new Date()
       if (now.getHours() === hour && now.getMinutes() === minute) {
         generateDailySummary()
@@ -542,7 +642,9 @@ export function apply(ctx: Context, config: Config) {
       const { url } = await storage.upload(buf, filename)
 
       for (const channelId of target.channelIds) {
-        const [platform, selfId, gid] = channelId.split(':')
+        const parts = channelId.split(':')
+        const [platform, selfId] = parts
+        const gid = parts.slice(2).join(':')
         await ctx.bots[`${platform}:${selfId}`]?.sendMessage(gid, h.image(url))
       }
     }
@@ -557,23 +659,28 @@ export function apply(ctx: Context, config: Config) {
     // 查询输入统计数据（今天0点到现在）
     const inputStats = await ctx.database.get('monitorluna_input_stats', {
       deviceId,
-      timestamp: { $gte: today, $lt: new Date() }
+      timestamp: { $gte: today, $lt: tomorrow }
     })
 
     // 构建图标映射
+    const iconHashes = [...new Set(inputStats.map(s => s.iconHash).filter(Boolean))]
+    const icons = iconHashes.length > 0 ? await ctx.database.get('monitorluna_icon', { hash: iconHashes }) : []
+    const iconHashDataMap = new Map(icons.map(i => [i.hash, i.data]))
+
     const iconMap = new Map<string, string>()
     for (const record of inputStats) {
-      if (record.iconBase64 && !iconMap.has(record.process)) {
-        iconMap.set(record.process, record.iconBase64)
+      if (record.iconHash && !iconMap.has(record.process)) {
+        const data = iconHashDataMap.get(record.iconHash)
+        if (data) iconMap.set(record.process, data)
       }
     }
 
     // 聚合输入统计
-    const appInputStats = new Map<string, { displayName: string, icon: string, keyPresses: number, clicks: number, scrollDistance: number }>()
+    const appInputStats = new Map<string, { displayName: string, iconHash: string, keyPresses: number, clicks: number, scrollDistance: number }>()
     for (const record of inputStats) {
       const existing = appInputStats.get(record.process) || {
         displayName: record.displayName,
-        icon: record.iconBase64,
+        iconHash: record.iconHash,
         keyPresses: 0,
         clicks: 0,
         scrollDistance: 0
@@ -727,11 +834,12 @@ ${topInputApps.map(([process, stats], idx) => {
       const keysInside = keysW > 30
       const clicksInside = clicksW > 30
       const scrollInside = scrollW > 30
+      const iconData = iconMap.get(process)
       return `<div class="input-stats-item">
 <div class="app-row">
   <div class="app-info">
     <span style="color:var(--ink-secondary);font-size:0.8rem;min-width:16px">${idx + 1}</span>
-    ${stats.icon ? `<img src="data:image/png;base64,${stats.icon}" class="app-icon">` : '<div style="width:16px"></div>'}
+    ${iconData ? `<img src="data:image/png;base64,${iconData}" class="app-icon">` : '<div style="width:16px"></div>'}
     <span class="app-name">${formatAppName(process)}</span>
   </div>
   <div class="bar-col">

@@ -5,15 +5,18 @@ WebUI 配置界面 + WebSocket 连接到 Koishi
 """
 import asyncio
 import base64
+import hashlib
 import io
 import json
 import os
+import sqlite3
 import sys
 import threading
 import time
 import webbrowser
 from pathlib import Path
 import platform
+from datetime import datetime, timedelta
 
 import psutil
 import pyautogui
@@ -41,6 +44,7 @@ else:
 
 # ── 配置 ──────────────────────────────────────────────────────────────────────
 CONFIG_PATH = Path(__file__).parent / "config.json"
+DB_PATH = Path(__file__).parent / "monitorluna.db"
 WEBUI_PORT = 6315
 
 DEFAULT_CONFIG = {
@@ -48,6 +52,52 @@ DEFAULT_CONFIG = {
     "token": "",
     "device_id": os.environ.get("COMPUTERNAME", "my-pc"),
 }
+
+
+def init_database():
+    """初始化本地 SQLite 数据库"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    # 活动记录表
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS activity (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            process TEXT NOT NULL,
+            title TEXT NOT NULL,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # 输入统计表
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS input_stats (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            process TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            icon_hash TEXT,
+            key_presses INTEGER DEFAULT 0,
+            left_clicks INTEGER DEFAULT 0,
+            right_clicks INTEGER DEFAULT 0,
+            scroll_distance REAL DEFAULT 0,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # Icon 缓存表
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS icons (
+            hash TEXT PRIMARY KEY,
+            data TEXT NOT NULL
+        )
+    """)
+
+    # 创建索引
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_activity_timestamp ON activity(timestamp)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_input_stats_timestamp ON input_stats(timestamp)")
+
+    conn.commit()
+    conn.close()
 
 
 def load_config() -> dict:
@@ -215,9 +265,10 @@ else:
 
 
 # ── 图标提取 ──────────────────────────────────────────────────────────────────
-def extract_icon_base64(process_name: str) -> str:
+def extract_icon_base64(process_name: str) -> tuple[str, str]:
+    """提取图标并返回 (hash, base64_data)"""
     if not (IS_WINDOWS and WINDOWS_FEATURES):
-        return ""  # 非 Windows 平台不支持图标提取
+        return "", ""  # 非 Windows 平台不支持图标提取
 
     if process_name in _icon_cache:
         return _icon_cache[process_name]
@@ -233,15 +284,15 @@ def extract_icon_base64(process_name: str) -> str:
                 continue
 
         if not exe_path or not os.path.exists(exe_path):
-            _icon_cache[process_name] = ""
-            return ""
+            _icon_cache[process_name] = ("", "")
+            return "", ""
 
         # 用 win32api.ExtractIconEx 提取图标
         try:
             large, small = win32api.ExtractIconEx(exe_path, 0)
         except Exception:
-            _icon_cache[process_name] = ""
-            return ""
+            _icon_cache[process_name] = ("", "")
+            return "", ""
 
         icon_handle = None
         handles_to_destroy = []
@@ -254,8 +305,8 @@ def extract_icon_base64(process_name: str) -> str:
             handles_to_destroy.extend(small[1:])
 
         if not icon_handle:
-            _icon_cache[process_name] = ""
-            return ""
+            _icon_cache[process_name] = ("", "")
+            return "", ""
 
         try:
             import win32ui
@@ -294,35 +345,143 @@ def extract_icon_base64(process_name: str) -> str:
                     pass
 
         if img is None:
-            _icon_cache[process_name] = ""
-            return ""
+            _icon_cache[process_name] = ("", "")
+            return "", ""
 
         buf = io.BytesIO()
         img.save(buf, "PNG")
-        result = base64.b64encode(buf.getvalue()).decode()
+        icon_data = base64.b64encode(buf.getvalue()).decode()
+        icon_hash = hashlib.md5(icon_data.encode()).hexdigest()
+
+        # 存储到数据库
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            cursor.execute("INSERT OR IGNORE INTO icons (hash, data) VALUES (?, ?)", (icon_hash, icon_data))
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
+        result = (icon_hash, icon_data)
         _icon_cache[process_name] = result
         return result
     except Exception:
-        _icon_cache[process_name] = ""
-        return ""
+        _icon_cache[process_name] = ("", "")
+        return "", ""
 
 
 def get_input_stats_snapshot() -> dict:
-    """返回当前输入统计快照，并为每个应用添加图标"""
+    """返回当前输入统计快照，存储到本地数据库，并返回需要上传的新 icon"""
     with _input_stats_lock:
         snapshot = {k: dict(v) for k, v in _app_stats.items()}
+        _app_stats.clear()
+
+    if not snapshot:
+        return {}
+
+    # 存储到本地数据库
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        timestamp = datetime.now().isoformat()
+
+        for process_name, stats in snapshot.items():
+            icon_hash, icon_data = extract_icon_base64(process_name)
+            cursor.execute("""
+                INSERT INTO input_stats (process, display_name, icon_hash, key_presses, left_clicks, right_clicks, scroll_distance, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                process_name,
+                stats["display_name"],
+                icon_hash,
+                stats["key_presses"],
+                stats["left_clicks"],
+                stats["right_clicks"],
+                stats["scroll_distance"],
+                timestamp
+            ))
+
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Failed to save input stats: {e}")
+
+    # 返回需要上传的新 icon（只返回本次快照中的 hash，Koishi 端会检查是否已存在）
     result = {}
     for process_name, stats in snapshot.items():
-        icon = extract_icon_base64(process_name)
+        icon_hash, icon_data = extract_icon_base64(process_name)
         result[process_name] = {
             "display_name": stats["display_name"],
-            "icon_base64": icon,
+            "icon_hash": icon_hash,
+            "icon_base64": icon_data if icon_data else "",
             "key_presses": stats["key_presses"],
             "left_clicks": stats["left_clicks"],
             "right_clicks": stats["right_clicks"],
             "scroll_distance": stats["scroll_distance"],
         }
     return result
+
+
+def save_activity_to_db(process: str, title: str):
+    """保存活动记录到本地数据库"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO activity (process, title, timestamp)
+            VALUES (?, ?, ?)
+        """, (process, title, datetime.now().isoformat()))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Failed to save activity: {e}")
+
+
+def query_daily_data(date_str: str = None) -> dict:
+    """查询指定日期的活动和输入统计数据（供 Koishi 调用）"""
+    if date_str is None:
+        date_str = datetime.now().strftime("%Y-%m-%d")
+
+    start_time = f"{date_str} 00:00:00"
+    end_time = f"{date_str} 23:59:59"
+
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+
+        # 查询活动记录
+        cursor.execute("""
+            SELECT process, title, timestamp FROM activity
+            WHERE timestamp BETWEEN ? AND ?
+            ORDER BY timestamp
+        """, (start_time, end_time))
+        activities = [{"process": row[0], "title": row[1], "timestamp": row[2]} for row in cursor.fetchall()]
+
+        # 查询输入统计
+        cursor.execute("""
+            SELECT process, display_name, icon_hash,
+                   SUM(key_presses), SUM(left_clicks), SUM(right_clicks), SUM(scroll_distance)
+            FROM input_stats
+            WHERE timestamp BETWEEN ? AND ?
+            GROUP BY process
+        """, (start_time, end_time))
+        input_stats = {}
+        for row in cursor.fetchall():
+            input_stats[row[0]] = {
+                "display_name": row[1],
+                "icon_hash": row[2],
+                "key_presses": row[3],
+                "left_clicks": row[4],
+                "right_clicks": row[5],
+                "scroll_distance": row[6]
+            }
+
+        conn.close()
+        return {"activities": activities, "input_stats": input_stats}
+    except Exception as e:
+        print(f"Failed to query daily data: {e}")
+        return {"activities": [], "input_stats": {}}
 
 
 # ── 窗口信息 ──────────────────────────────────────────────────────────────────
@@ -382,6 +541,7 @@ def take_window_screenshot() -> str:
 # ── WebSocket Agent ───────────────────────────────────────────────────────────
 class MonitorLunaAgent:
     def __init__(self):
+        init_database()  # 初始化本地数据库
         self.config = load_config()
         self.status = "未连接"
         self.running = True
@@ -409,15 +569,21 @@ class MonitorLunaAgent:
             elif cmd == "system_status":
                 data = await asyncio.get_event_loop().run_in_executor(None, get_system_status)
                 return {"type": "result", "id": cmd_id, "ok": True, "data": json.dumps(data, ensure_ascii=False)}
+            elif cmd == "query_daily_data":
+                date_str = msg.get("date")
+                data = await asyncio.get_event_loop().run_in_executor(None, query_daily_data, date_str)
+                return {"type": "result", "id": cmd_id, "ok": True, "data": json.dumps(data, ensure_ascii=False)}
             else:
                 return {"type": "result", "id": cmd_id, "ok": False, "error": f"unknown command: {cmd}"}
         except Exception as e:
             return {"type": "result", "id": cmd_id, "ok": False, "error": str(e)}
 
-    async def _run_once(self):
+    async def _run_once(self) -> bool:
+        """返回 True 表示曾成功连接过"""
         cfg = self.config
         url = cfg["url"]
         self.status = f"连接中... {url}"
+        connected = False
         try:
             async with websockets.connect(url, open_timeout=10, ping_interval=30, ping_timeout=10) as ws:
                 self._ws = ws
@@ -425,7 +591,8 @@ class MonitorLunaAgent:
                 ack = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
                 if ack.get("type") != "hello_ack":
                     self.status = f"握手失败: {ack.get('message', '未知错误')}"
-                    return
+                    return False
+                connected = True
                 self.status = f"已连接 ✓ ({cfg['device_id']})"
                 self._last_window = None
                 monitor_task = asyncio.get_event_loop().create_task(self._window_monitor(ws, cfg["device_id"]))
@@ -448,6 +615,7 @@ class MonitorLunaAgent:
         except Exception as e:
             self.status = f"断开: {e}"
             self._ws = None
+        return connected
 
     async def _window_monitor(self, ws, device_id: str):
         while True:
@@ -456,6 +624,9 @@ class MonitorLunaAgent:
                 key = (info["process"], info["title"])
                 if key != self._last_window:
                     self._last_window = key
+                    # 存储到本地数据库
+                    await asyncio.get_event_loop().run_in_executor(None, save_activity_to_db, info["process"], info["title"])
+                    # 发送到 Koishi（可选，用于实时监控）
                     await ws.send(json.dumps({
                         "type": "activity",
                         "device_id": device_id,
@@ -484,9 +655,11 @@ class MonitorLunaAgent:
     async def run_forever(self):
         delay = 3
         while self.running:
-            await self._run_once()
+            was_connected = await self._run_once()
             if not self.running:
                 break
+            if was_connected:
+                delay = 3
             self.status = f"重连中... ({delay}s 后)"
             await asyncio.sleep(delay)
             delay = min(delay * 2, 60)
@@ -588,13 +761,19 @@ async def handle_index(request):
 
 async def handle_get_config(request):
     agent = request.app["agent"]
-    return web.json_response(agent.config)
+    safe_config = dict(agent.config)
+    safe_config["token"] = "***" if safe_config.get("token") else ""
+    return web.json_response(safe_config)
 
 
 async def handle_post_config(request):
     agent = request.app["agent"]
     data = await request.json()
-    save_config(data)
+    allowed_keys = {"url", "token", "device_id"}
+    filtered = {k: v for k, v in data.items() if k in allowed_keys}
+    if filtered.get("token") == "***":
+        filtered["token"] = agent.config.get("token", "")
+    save_config({**agent.config, **filtered})
     agent.stop()
     await asyncio.sleep(0.5)
     agent.config = data
