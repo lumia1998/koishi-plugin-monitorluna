@@ -27,6 +27,8 @@ from PIL import Image, ImageDraw
 
 # Windows 特定导入（可选）
 IS_WINDOWS = platform.system() == "Windows"
+WINDOWS_FEATURES = False
+TRAY_FEATURES = False
 if IS_WINDOWS:
     try:
         from ctypes import windll, WINFUNCTYPE, c_int, c_void_p, byref
@@ -35,13 +37,15 @@ if IS_WINDOWS:
         import win32process
         import win32api
         import win32con
-        import pystray
         WINDOWS_FEATURES = True
-    except ImportError:
-        WINDOWS_FEATURES = False
-        print("Warning: Windows-specific features disabled (missing pywin32)")
-else:
-    WINDOWS_FEATURES = False
+    except Exception as e:
+        print(f"Warning: Windows API features disabled: {e}")
+
+    try:
+        import pystray
+        TRAY_FEATURES = True
+    except Exception as e:
+        print(f"Warning: tray icon disabled: {e}")
 
 # ── 配置 ──────────────────────────────────────────────────────────────────────
 CONFIG_PATH = Path(__file__).parent / "config.json"
@@ -1032,7 +1036,7 @@ def main():
     # WebUI 在后台线程运行
     threading.Thread(target=start_webui, args=(agent,), daemon=True).start()
 
-    if IS_WINDOWS and WINDOWS_FEATURES:
+    if IS_WINDOWS and TRAY_FEATURES:
         # Windows 托盘图标
         def on_settings(icon, item):
             webbrowser.open(f"http://127.0.0.1:{WEBUI_PORT}")
