@@ -348,21 +348,22 @@ def _clean_display_name(value: str) -> str:
         return ""
 
     ignored = {
-        "app",
-        "application",
-        "electron",
-        "runtime broker",
-        "windows application",
+        "app", "application", "electron", "runtime broker", "windows application",
+        "host process for windows services", "windows host process (rundll32)",
+        "stub", "launcher", "setup"
     }
     normalized = text.lower()
-    if normalized in ignored:
+    if normalized in ignored or len(text) < 2:
         return ""
 
+    # 移除常见的后缀
     for suffix in (
         " - Wez's Terminal Emulator",
         " - Google Chrome",
         " - Microsoft Edge",
         " - Mozilla Firefox",
+        " (64-bit)",
+        " (32-bit)",
     ):
         if text.endswith(suffix):
             text = text[:-len(suffix)].strip()
@@ -374,25 +375,48 @@ def _resolve_display_name(process_name: str, window_title: str = "") -> str:
     if not process_name:
         return "unknown"
 
-    cached = _display_name_cache.get(process_name)
+    process_lower = process_name.lower()
+    cached = _display_name_cache.get(process_lower)
     if cached:
         return cached
 
-    override = _DISPLAY_NAME_OVERRIDES.get(process_name.lower())
+    override = _DISPLAY_NAME_OVERRIDES.get(process_lower)
     if override:
-        _display_name_cache[process_name] = override
+        _display_name_cache[process_lower] = override
         return override
 
     exe_path = _get_process_exe_path(process_name)
+    display_name = ""
+    
+    # 尝试从文件版本信息获取
     for key in ("FileDescription", "ProductName", "InternalName"):
-        value = _clean_display_name(_get_file_version_string(exe_path, key))
-        if value and value.lower() != process_name.lower():
-            _display_name_cache[process_name] = value
-            return value
+        val = _clean_display_name(_get_file_version_string(exe_path, key))
+        if val and val.lower() != process_lower:
+            display_name = val
+            break
 
-    fallback = process_name.replace(".exe", "")
-    _display_name_cache[process_name] = fallback
-    return fallback
+    # 如果解析出来的名称太普通，或者没解析出来，使用 EXE 文件名美化
+    if not display_name or display_name.lower() in ("app", "application"):
+        name_part = process_name.rsplit(".", 1)[0]
+        # 处理 camelCase 或 snake_case
+        display_name = name_part.replace("-", " ").replace("_", " ").title()
+
+    _display_name_cache[process_lower] = display_name
+    return display_name
+
+
+def _is_similar_title(t1: str, t2: str) -> bool:
+    """判定两个标题是否相似（忽略数字、百分比、时间等动态变动）"""
+    if t1 == t2: return True
+    if not t1 or not t2: return False
+    
+    # 移除数字、百分比、括号内的内容（通常是进度或路径）
+    def normalize(t):
+        t = re.sub(r"\d+|%|\([^)]*\)|\[[^\]]*\]", "", t)
+        t = re.sub(r"\s+", " ", t).strip()
+        return t
+    
+    return normalize(t1) == normalize(t2)
 
 
 def _get_current_app_info() -> dict:
@@ -812,13 +836,13 @@ def query_daily_data(date_str: str = None) -> dict:
                 "domains": sorted(item["domains"]),
             }
 
-        # 查询图标数据
-        icons = {}
-        if icon_hashes:
-            placeholders = ','.join('?' * len(icon_hashes))
-            cursor.execute(f"SELECT hash, data FROM icons WHERE hash IN ({placeholders})", tuple(icon_hashes))
-            for row in cursor.fetchall():
-                icons[row[0]] = row[1]
+        # 暂时移除图标数据传输，前端目前未直接渲染
+        # icons = {}
+        # if icon_hashes:
+        #     placeholders = ','.join('?' * len(icon_hashes))
+        #     cursor.execute(f"SELECT hash, data FROM icons WHERE hash IN ({placeholders})", tuple(icon_hashes))
+        #     for row in cursor.fetchall():
+        #         icons[row[0]] = row[1]
 
         conn.close()
         return {
@@ -826,7 +850,7 @@ def query_daily_data(date_str: str = None) -> dict:
             "input_stats": input_stats,
             "browser_activity": browser_activity,
             "display_names": display_names,
-            "icons": icons
+            "icons": {} # 返回空对象以保持兼容性
         }
     except Exception as e:
         print(f"Failed to query daily data: {e}")
@@ -1012,15 +1036,17 @@ class MonitorLunaAgent:
                 now = time.time()
                 
                 # 记录逻辑：窗口变化 OR 距离上次记录超过 5 分钟 (心跳)
-                if key != self._last_window or (now - last_save_time) > 300:
+                is_changed = (info["process"] != (self._last_window[0] if self._last_window else None)) or \
+                             not _is_similar_title(info["title"], (self._last_window[1] if self._last_window else None))
+
+                if is_changed or (now - last_save_time) > 300:
                     # 改进：如果进程名为有效值，才进行记录（心跳不记录失败状态）
                     is_valid = info["process"] not in ("unknown", "N/A", "")
-                    
-                    if key != self._last_window or is_valid:
-                        self._last_window = key
+
+                    if is_changed or is_valid:
+                        self._last_window = (info["process"], info["title"])
                         last_save_time = now
                         await asyncio.get_event_loop().run_in_executor(None, save_activity_to_db, info["process"], info["title"])
-                
                 if ws.closed:
                     break
             except asyncio.CancelledError:

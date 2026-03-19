@@ -657,7 +657,8 @@ export function apply(ctx: Context, config: Config) {
     for (let h = 0; h < 24; h++) hourlyStats.set(h, new Map())
 
     const now = new Date()
-    const CONFIDENCE_LIMIT_MS = 10 * 60 * 1000 // 10 分钟上限
+    const CONFIDENCE_LIMIT_MS = 5 * 60 * 1000 // 置信上限：单条记录最大计入 5 分钟
+    const GAP_THRESHOLD_MS = 10 * 60 * 1000 // 断档判定：超过 10 分钟认为中间离线
 
     for (let i = 0; i < records.length; i++) {
       const curr = records[i]
@@ -668,19 +669,27 @@ export function apply(ctx: Context, config: Config) {
 
       if (next) {
         nextTime = new Date(next.timestamp).getTime()
+        // 核心优化：如果两条记录间隔太长（如关机 5 小时），则当前记录只给一个基础时长
+        if (nextTime - currTime > GAP_THRESHOLD_MS) {
+          nextTime = currTime + 60 * 1000 // 仅计入 1 分钟
+        }
       } else {
-        // 改进：增加置信上限。如果最后一条记录太旧，不再补全到“现在”
+        // 最后一条记录到现在的处理
         const endOfToday = new Date(now).setHours(23, 59, 59, 999)
         const logicalEnd = Math.min(now.getTime(), endOfToday)
         nextTime = Math.min(logicalEnd, currTime + CONFIDENCE_LIMIT_MS)
       }
       
-      const duration = (nextTime - currTime) / 1000 / 60
-      if (duration <= 0) continue
+      // 限制单次时长的置信度，防止异常大数据
+      let durationMs = nextTime - currTime
+      if (durationMs > CONFIDENCE_LIMIT_MS) durationMs = CONFIDENCE_LIMIT_MS
+      
+      const durationMin = durationMs / 1000 / 60
+      if (durationMin <= 0) continue
 
       const hour = new Date(curr.timestamp).getHours()
       const processMap = hourlyStats.get(hour)!
-      processMap.set(curr.process, (processMap.get(curr.process) || 0) + duration)
+      processMap.set(curr.process, (processMap.get(curr.process) || 0) + durationMin)
     }
 
     const hourlyTop4 = new Map<number, Array<[string, number]>>()
