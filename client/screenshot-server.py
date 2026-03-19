@@ -201,6 +201,24 @@ _icon_cache = {}  # process_name -> base64 string
 # 浏览器活动统计（由本地 /ws/browser 端点接收）
 _browser_stats_lock = threading.Lock()
 _browser_stats = {}  # page_key -> {domain, title, url, seconds}
+_process_exe_cache = {}
+_display_name_cache = {}
+_DISPLAY_NAME_OVERRIDES = {
+    "applicationframehost.exe": "Windows 应用",
+    "centbrowser.exe": "Cent Browser",
+    "chrome.exe": "Google Chrome",
+    "code.exe": "Visual Studio Code",
+    "explorer.exe": "资源管理器",
+    "firefox.exe": "Firefox",
+    "gameviewer.exe": "网易UU远程",
+    "msedge.exe": "Microsoft Edge",
+    "qq.exe": "QQ",
+    "steam.exe": "Steam",
+    "wechat.exe": "微信",
+    "weixin.exe": "微信",
+    "wezterm-gui.exe": "WezTerm",
+    "uu.exe": "UU加速器",
+}
 
 
 def _extract_domain(value: str) -> str:
@@ -289,6 +307,105 @@ def _site_title_candidates(title: str) -> list[str]:
     return candidates
 
 
+def _get_process_exe_path(process_name: str) -> str:
+    if not process_name:
+        return ""
+
+    cached = _process_exe_cache.get(process_name)
+    if cached and os.path.exists(cached):
+        return cached
+
+    for proc in psutil.process_iter(["name", "exe"]):
+        try:
+            if proc.info["name"] == process_name and proc.info["exe"]:
+                exe_path = proc.info["exe"]
+                _process_exe_cache[process_name] = exe_path
+                return exe_path
+        except Exception:
+            continue
+
+    _process_exe_cache[process_name] = ""
+    return ""
+
+
+def _get_file_version_string(exe_path: str, key: str) -> str:
+    if not (PYWIN32_FEATURES and exe_path and os.path.exists(exe_path)):
+        return ""
+    try:
+        translations = win32api.GetFileVersionInfo(exe_path, "\\VarFileInfo\\Translation")
+        if not translations:
+            return ""
+        lang, codepage = translations[0]
+        value = win32api.GetFileVersionInfo(exe_path, f"\\StringFileInfo\\{lang:04x}{codepage:04x}\\{key}")
+        return value.strip() if isinstance(value, str) else ""
+    except Exception:
+        return ""
+
+
+def _clean_display_name(value: str) -> str:
+    text = (value or "").strip().strip("\x00")
+    if not text:
+        return ""
+
+    ignored = {
+        "app",
+        "application",
+        "electron",
+        "runtime broker",
+        "windows application",
+    }
+    normalized = text.lower()
+    if normalized in ignored:
+        return ""
+
+    for suffix in (
+        " - Wez's Terminal Emulator",
+        " - Google Chrome",
+        " - Microsoft Edge",
+        " - Mozilla Firefox",
+    ):
+        if text.endswith(suffix):
+            text = text[:-len(suffix)].strip()
+
+    return text
+
+
+def _resolve_display_name(process_name: str, window_title: str = "") -> str:
+    if not process_name:
+        return "unknown"
+
+    cached = _display_name_cache.get(process_name)
+    if cached:
+        return cached
+
+    override = _DISPLAY_NAME_OVERRIDES.get(process_name.lower())
+    if override:
+        _display_name_cache[process_name] = override
+        return override
+
+    exe_path = _get_process_exe_path(process_name)
+    for key in ("FileDescription", "ProductName", "InternalName"):
+        value = _clean_display_name(_get_file_version_string(exe_path, key))
+        if value and value.lower() != process_name.lower():
+            _display_name_cache[process_name] = value
+            return value
+
+    fallback = process_name.replace(".exe", "")
+    _display_name_cache[process_name] = fallback
+    return fallback
+
+
+def _get_current_app_info() -> dict:
+    info = _get_foreground_window_info()
+    process_name = info.get("process") or "unknown"
+    return {
+        "process": process_name,
+        "display_name": _resolve_display_name(process_name),
+        "title": info.get("title", ""),
+        "pid": info.get("pid", -1),
+    }
+
+
 def _get_foreground_process_name() -> str:
     if not (IS_WINDOWS and WINDOWS_FEATURES):
         return "unknown"
@@ -361,15 +478,17 @@ if IS_WINDOWS and WINDOWS_FEATURES:
         except Exception:
             return "unknown"
 
-    def _ensure_app_entry(process_name: str):
+    def _ensure_app_entry(process_name: str, display_name: str = ""):
         if process_name not in _app_stats:
             _app_stats[process_name] = {
-                "display_name": process_name.replace(".exe", ""),
+                "display_name": display_name or _resolve_display_name(process_name),
                 "key_presses": 0,
                 "left_clicks": 0,
                 "right_clicks": 0,
                 "scroll_distance": 0.0,
             }
+        elif display_name:
+            _app_stats[process_name]["display_name"] = display_name
 
     def _keyboard_proc(nCode, wParam, lParam):
         if nCode >= 0:
@@ -377,33 +496,40 @@ if IS_WINDOWS and WINDOWS_FEATURES:
             ptr = ctypes.cast(lParam, ctypes.POINTER(ctypes.c_ulong))
             vk_code = ptr[0]
             if wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
-                if vk_code not in _pressed_keys:
-                    _pressed_keys.add(vk_code)
-                    process_name = _get_current_process_name()
+                app_info = _get_current_app_info()
+                if app_info["process"] in ("", "unknown", "N/A"):
+                    return windll.user32.CallNextHookEx(None, nCode, wParam, lParam)
+                token = (app_info["process"], vk_code)
+                if token not in _pressed_keys:
+                    _pressed_keys.add(token)
                     with _input_stats_lock:
-                        _ensure_app_entry(process_name)
-                        _app_stats[process_name]["key_presses"] += 1
+                        _ensure_app_entry(app_info["process"], app_info["display_name"])
+                        _app_stats[app_info["process"]]["key_presses"] += 1
             elif wParam in (WM_KEYUP, WM_SYSKEYUP):
-                _pressed_keys.discard(vk_code)
+                stale = [token for token in _pressed_keys if token[1] == vk_code]
+                for token in stale:
+                    _pressed_keys.discard(token)
         return windll.user32.CallNextHookEx(None, nCode, wParam, lParam)
 
     def _mouse_proc(nCode, wParam, lParam):
         if nCode >= 0:
             if wParam in (WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MOUSEWHEEL):
-                process_name = _get_current_process_name()
+                app_info = _get_current_app_info()
+                if app_info["process"] in ("", "unknown", "N/A"):
+                    return windll.user32.CallNextHookEx(None, nCode, wParam, lParam)
                 with _input_stats_lock:
-                    _ensure_app_entry(process_name)
+                    _ensure_app_entry(app_info["process"], app_info["display_name"])
                     if wParam == WM_LBUTTONDOWN:
-                        _app_stats[process_name]["left_clicks"] += 1
+                        _app_stats[app_info["process"]]["left_clicks"] += 1
                     elif wParam == WM_RBUTTONDOWN:
-                        _app_stats[process_name]["right_clicks"] += 1
+                        _app_stats[app_info["process"]]["right_clicks"] += 1
                     elif wParam == WM_MOUSEWHEEL:
                         # lParam 是 LPARAM（整数），转为指针读取 MSLLHOOKSTRUCT.mouseData
                         ptr = ctypes.cast(lParam, ctypes.POINTER(ctypes.c_ulong))
                         mouse_data = ptr[2]
                         delta = ctypes.c_short(mouse_data >> 16).value
                         ticks = abs(delta) / WHEEL_DELTA
-                        _app_stats[process_name]["scroll_distance"] += ticks
+                        _app_stats[app_info["process"]]["scroll_distance"] += ticks
         return windll.user32.CallNextHookEx(None, nCode, wParam, lParam)
 
     KEYBOARD_PROC_TYPE = WINFUNCTYPE(wintypes.LPARAM, c_int, wintypes.WPARAM, wintypes.LPARAM)
@@ -640,6 +766,7 @@ def query_daily_data(date_str: str = None) -> dict:
             GROUP BY process
         """, (date_str,))
         input_stats = {}
+        display_names = {}
         icon_hashes = set()
         for row in cursor.fetchall():
             input_stats[row[0]] = {
@@ -650,8 +777,12 @@ def query_daily_data(date_str: str = None) -> dict:
                 "right_clicks": row[5],
                 "scroll_distance": row[6]
             }
+            display_names[row[0]] = row[1] or _resolve_display_name(row[0])
             if row[2]:
                 icon_hashes.add(row[2])
+
+        for process in {activity["process"] for activity in activities if activity["process"] not in ("unknown", "N/A", "")}:
+            display_names[process] = display_names.get(process) or _resolve_display_name(process)
 
         # 查询浏览器活动
         cursor.execute(f"""
@@ -694,11 +825,12 @@ def query_daily_data(date_str: str = None) -> dict:
             "activities": activities,
             "input_stats": input_stats,
             "browser_activity": browser_activity,
+            "display_names": display_names,
             "icons": icons
         }
     except Exception as e:
         print(f"Failed to query daily data: {e}")
-        return {"activities": [], "input_stats": {}, "browser_activity": {}, "icons": {}}
+        return {"activities": [], "input_stats": {}, "browser_activity": {}, "display_names": {}, "icons": {}}
 
 
 def get_browser_stats_snapshot() -> dict:
@@ -735,7 +867,7 @@ def get_browser_stats_snapshot() -> dict:
 # ── 窗口信息 ──────────────────────────────────────────────────────────────────
 def get_window_info() -> dict:
     info = _get_foreground_window_info()
-    return {"title": info["title"], "process": info["process"], "pid": info["pid"]}
+    return {"title": info["title"], "process": info["process"], "pid": info["pid"], "display_name": _resolve_display_name(info["process"])}
 
 
 # ── 系统状态 ──────────────────────────────────────────────────────────────────

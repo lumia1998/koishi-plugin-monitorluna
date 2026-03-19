@@ -626,7 +626,7 @@ export function apply(ctx: Context, config: Config) {
     const records = data.activities || []
     const inputStatsData = data.input_stats || {}
     const browserActivityData = data.browser_activity || {}
-    const iconsData = data.icons || {}
+    const displayNamesData = data.display_names || {}
 
     // 处理浏览器活动
     const topBrowserSites: Array<{ site: string, domains: string[], seconds: number }> = (Object.entries(browserActivityData) as [string, any][])
@@ -638,20 +638,11 @@ export function apply(ctx: Context, config: Config) {
       .sort((a, b) => b.seconds - a.seconds)
       .slice(0, 4)
 
-    // 构建图标映射
-    const iconMap = new Map<string, string>()
-    for (const [process, stats] of Object.entries(inputStatsData) as [string, any][]) {
-      if (stats.icon_hash && iconsData[stats.icon_hash]) {
-        iconMap.set(process, iconsData[stats.icon_hash])
-      }
-    }
-
     // 处理输入统计
-    interface InputAppStats { displayName: string, iconHash: string, keyPresses: number, clicks: number, scrollDistance: number }
+    interface InputAppStats { displayName: string, keyPresses: number, clicks: number, scrollDistance: number }
     const inputApps: [string, InputAppStats][] = (Object.entries(inputStatsData) as [string, any][])
       .map(([process, stats]) => [process, {
-        displayName: stats.display_name,
-        iconHash: stats.icon_hash,
+        displayName: displayNamesData[process] || stats.display_name || process,
         keyPresses: stats.key_presses || 0,
         clicks: (stats.left_clicks || 0) + (stats.right_clicks || 0),
         scrollDistance: stats.scroll_distance || 0
@@ -712,7 +703,6 @@ export function apply(ctx: Context, config: Config) {
     const topInputApps: Array<[string, InputAppStats & { duration: number }]> = topDurationApps.map(([process, duration]) => {
       const stats = inputStatsMap.get(process) || {
         displayName: process,
-        iconHash: '',
         keyPresses: 0,
         clicks: 0,
         scrollDistance: 0,
@@ -788,14 +778,13 @@ body{font-family:var(--font-body);color:var(--ink-primary);background-color:var(
 .hour-section{margin-bottom:20px;padding:12px;border:1px dashed var(--ink-secondary);border-radius:8px;background:#fafafa}
 .hour-label{font-weight:700;color:var(--ink-secondary);margin-bottom:6px;font-size:0.95rem}
 .hour-list{display:flex;flex-wrap:wrap;gap:6px}
-.hour-tag{background:var(--color-blue);padding:3px 0;border-radius:12px;font-size:0.85rem;color:var(--ink-primary);display:inline-flex;overflow:hidden;align-items:center}
-.hour-tag-name{background:var(--color-blue);padding:3px 10px;color:var(--ink-primary);display:flex;align-items:center;gap:4px}
-.hour-tag-time{background:#fff;padding:3px 10px;color:var(--ink-primary);font-weight:600}
+.hour-tag{background:var(--color-blue);padding:4px 12px;border-radius:999px;font-size:0.85rem;color:var(--ink-primary);display:inline-flex;overflow:hidden;align-items:center;gap:6px}
+.hour-tag-name{padding:0;color:var(--ink-primary);display:flex;align-items:center;gap:4px}
+.hour-tag-time{padding:0;color:var(--ink-primary);font-weight:600}
 .input-stats-item{padding:8px 0;border-bottom:1px dashed #e0e0e0}
 .input-stats-item:last-child{border-bottom:none}
 .app-row{display:grid;grid-template-columns:1fr 160px 120px 120px;align-items:center;gap:8px}
 .app-info{display:flex;align-items:center;gap:6px;overflow:hidden}
-.app-icon{width:16px;height:16px;border-radius:3px;flex-shrink:0;object-fit:contain}
 .app-name{font-weight:600;color:var(--ink-primary);font-size:0.85rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .bar-col{display:flex;flex-direction:column;gap:2px}
 .bar-track{background:#f0f0f0;border-radius:4px;height:16px;position:relative;overflow:hidden}
@@ -831,11 +820,9 @@ ${pieSegments.length > 0 ? `<div class="pie-layout">
 </div>
 <div class="pie-legend">
   ${pieSegments.map((segment, idx) => {
-      const icon = iconMap.get(segment.process)
-      const displayName = inputStatsMap.get(segment.process)?.displayName
-      const iconHtml = icon ? `<img src="data:image/png;base64,${icon}" class="app-icon">` : '<div style="width:16px;height:16px;flex-shrink:0"></div>'
+      const displayName = inputStatsMap.get(segment.process)?.displayName || displayNamesData[segment.process]
       const percent = totalTrackedMinutes > 0 ? Math.round(segment.minutes / totalTrackedMinutes * 100) : 0
-      return `<div class="pie-legend-item"><div class="pie-legend-name"><span class="pie-color" style="background:${segment.color}"></span>${iconHtml}<span class="pie-legend-text">${idx + 1}. ${formatAppName(segment.process, displayName)}</span></div><span class="pie-legend-value">${Math.round(segment.minutes)}m · ${percent}%</span></div>`
+      return `<div class="pie-legend-item"><div class="pie-legend-name"><span class="pie-color" style="background:${segment.color}"></span><span class="pie-legend-text">${idx + 1}. ${formatAppName(segment.process, displayName)}</span></div><span class="pie-legend-value">${Math.round(segment.minutes)}m · ${percent}%</span></div>`
     }).join('')}
 </div>
 </div>` : '<div style="color:var(--ink-secondary);text-align:center;padding:20px">暂无应用时长数据</div>'}
@@ -858,12 +845,10 @@ ${topInputApps.map(([process, stats], idx) => {
       const keysInside = keysW > 30
       const clicksInside = clicksW > 30
       const scrollInside = scrollW > 30
-      const iconData = iconMap.get(process)
       return `<div class="input-stats-item">
 <div class="app-row">
   <div class="app-info">
     <span style="color:var(--ink-secondary);font-size:0.8rem;min-width:16px">${idx + 1}</span>
-    ${iconData ? `<img src="data:image/png;base64,${iconData}" class="app-icon">` : '<div style="width:16px"></div>'}
     <span class="app-name">${formatAppName(process, stats.displayName)}</span>
   </div>
   <div class="bar-col">
@@ -899,10 +884,8 @@ ${Array.from(hourlyTop4.entries()).filter(([, top]) => top.length > 0).map(([hou
 <div class="hour-label">${hour}:00 - ${hour}:59</div>
 <div class="hour-list">
 ${top.map(([app, dur]) => {
-      const icon = iconMap.get(app)
-      const iconHtml = icon ? `<img src="data:image/png;base64,${icon}" style="width:14px;height:14px;margin-right:3px;vertical-align:middle">` : ''
-      const displayName = inputStatsMap.get(app)?.displayName
-      return `<span class="hour-tag"><span class="hour-tag-name">${iconHtml}${formatAppName(app, displayName)}</span><span class="hour-tag-time">${Math.round(dur)}m</span></span>`
+      const displayName = inputStatsMap.get(app)?.displayName || displayNamesData[app]
+      return `<span class="hour-tag"><span class="hour-tag-name">${formatAppName(app, displayName)}</span><span class="hour-tag-time">${Math.round(dur)}m</span></span>`
     }).join('')}
 </div>
 </div>`).join('')}
