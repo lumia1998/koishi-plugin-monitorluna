@@ -1,6 +1,6 @@
 {
   "name": "koishi-plugin-monitorluna",
-  "version": "1.4.1",
+  "version": "1.4.2",
   "description": "远程设备监控插件（截图、窗口信息、系统状态）",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",

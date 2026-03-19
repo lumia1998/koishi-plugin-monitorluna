@@ -27,5 +27,18 @@ exit /b 1
 
 :run
 echo Starting MonitorLuna Agent with Python 3.12...
-%UV% run --python 3.12 screenshot-server.py
+%UV% sync --python 3.12 --link-mode copy
+if errorlevel 1 (
+    echo Failed to prepare Python environment.
+    pause
+    exit /b 1
+)
+
+if not exist ".venv\Scripts\python.exe" (
+    echo Python environment was created, but .venv\Scripts\python.exe was not found.
+    pause
+    exit /b 1
+)
+
+.venv\Scripts\python.exe screenshot-server.py
 pause

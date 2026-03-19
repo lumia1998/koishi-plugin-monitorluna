@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.2] - 2026-03-19
+
+### 🐛 修复
+
+- 修复 release 包中 `start-server.bat` 使用 `uv run` 时在部分 Windows 环境下参数解析异常的问题。
+- 启动流程改为先 `uv sync` 创建环境，再直接调用 `.venv\\Scripts\\python.exe` 运行 Agent。
+
 ## [1.4.1] - 2026-03-19
 
 ### 🐛 修复
