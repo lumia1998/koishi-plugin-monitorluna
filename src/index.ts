@@ -13,7 +13,7 @@ export const usage = `
 
 ### 下载 Windows Agent
 
-[点击下载 monitorluna-agent.zip](https://github.com/lumia1998/koishi-plugin-monitorluna/releases/download/v1.1.1/monitorluna-agent.zip)
+[点击下载 monitorluna-agent.zip](https://github.com/lumia1998/koishi-plugin-monitorluna/releases/latest/download/monitorluna-agent.zip)
 
 解压后双击 \`start-silent.vbs\` 启动，然后访问 http://127.0.0.1:6315 配置连接信息。
 
