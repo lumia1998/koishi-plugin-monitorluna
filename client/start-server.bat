@@ -26,6 +26,6 @@ pause
 exit /b 1
 
 :run
-echo Starting MonitorLuna Agent...
-%UV% run screenshot-server.py
+echo Starting MonitorLuna Agent with Python 3.12...
+%UV% run --python 3.12 screenshot-server.py
 pause

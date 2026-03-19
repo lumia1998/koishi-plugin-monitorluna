@@ -618,7 +618,10 @@ export function apply(ctx: Context, config: Config) {
 
   async function buildSummaryHtml(data: any, deviceId: string): Promise<string> {
     const date = new Date().toLocaleDateString('zh-CN')
-    const formatAppName = (process: string) => process.replace(/\.exe$/i, '')
+    const formatAppName = (process: string, displayName?: string) => {
+      const name = (displayName || process || '').trim()
+      return name.replace(/\.exe$/i, '')
+    }
 
     const records = data.activities || []
     const inputStatsData = data.input_stats || {}
@@ -626,9 +629,14 @@ export function apply(ctx: Context, config: Config) {
     const iconsData = data.icons || {}
 
     // 处理浏览器活动
-    const topBrowserDomains: [string, number][] = (Object.entries(browserActivityData) as [string, number][])
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 8)
+    const topBrowserSites: Array<{ site: string, domains: string[], seconds: number }> = (Object.entries(browserActivityData) as [string, any][])
+      .map(([site, item]) => ({
+        site,
+        domains: Array.isArray(item?.domains) ? item.domains : [],
+        seconds: item?.seconds || 0,
+      }))
+      .sort((a, b) => b.seconds - a.seconds)
+      .slice(0, 4)
 
     // 构建图标映射
     const iconMap = new Map<string, string>()
@@ -640,7 +648,7 @@ export function apply(ctx: Context, config: Config) {
 
     // 处理输入统计
     interface InputAppStats { displayName: string, iconHash: string, keyPresses: number, clicks: number, scrollDistance: number }
-    const topInputApps: [string, InputAppStats][] = (Object.entries(inputStatsData) as [string, any][])
+    const inputApps: [string, InputAppStats][] = (Object.entries(inputStatsData) as [string, any][])
       .map(([process, stats]) => [process, {
         displayName: stats.display_name,
         iconHash: stats.icon_hash,
@@ -648,12 +656,8 @@ export function apply(ctx: Context, config: Config) {
         clicks: (stats.left_clicks || 0) + (stats.right_clicks || 0),
         scrollDistance: stats.scroll_distance || 0
       }] as [string, InputAppStats])
-      .sort((a, b) => (b[1].keyPresses + b[1].clicks) - (a[1].keyPresses + a[1].clicks))
-      .slice(0, 6)
 
-    const maxKeys = Math.max(...topInputApps.map((a: any) => a[1].keyPresses), 1)
-    const maxClicks = Math.max(...topInputApps.map((a: any) => a[1].clicks), 1)
-    const maxScroll = Math.max(...topInputApps.map((a: any) => a[1].scrollDistance), 1)
+    const inputStatsMap = new Map(inputApps)
 
     // 处理活动记录
     records.sort((a: any, b: any) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())
@@ -661,21 +665,32 @@ export function apply(ctx: Context, config: Config) {
     const hourlyStats = new Map<number, Map<string, number>>()
     for (let h = 0; h < 24; h++) hourlyStats.set(h, new Map())
 
-    for (let i = 0; i < records.length - 1; i++) {
+    const now = new Date()
+    const CONFIDENCE_LIMIT_MS = 10 * 60 * 1000 // 10 分钟上限
+
+    for (let i = 0; i < records.length; i++) {
       const curr = records[i]
       const next = records[i + 1]
-      const duration = (new Date(next.timestamp).getTime() - new Date(curr.timestamp).getTime()) / 1000 / 60
+      
+      const currTime = new Date(curr.timestamp).getTime()
+      let nextTime: number
+
+      if (next) {
+        nextTime = new Date(next.timestamp).getTime()
+      } else {
+        // 改进：增加置信上限。如果最后一条记录太旧，不再补全到“现在”
+        const endOfToday = new Date(now).setHours(23, 59, 59, 999)
+        const logicalEnd = Math.min(now.getTime(), endOfToday)
+        nextTime = Math.min(logicalEnd, currTime + CONFIDENCE_LIMIT_MS)
+      }
+      
+      const duration = (nextTime - currTime) / 1000 / 60
+      if (duration <= 0) continue
+
       const hour = new Date(curr.timestamp).getHours()
       const processMap = hourlyStats.get(hour)!
       processMap.set(curr.process, (processMap.get(curr.process) || 0) + duration)
     }
-
-    const hourlyActivity = new Map<number, number>()
-    for (let h = 0; h < 24; h++) hourlyActivity.set(h, 0)
-    records.forEach((r: any) => {
-      const hour = new Date(r.timestamp).getHours()
-      hourlyActivity.set(hour, (hourlyActivity.get(hour) || 0) + 1)
-    })
 
     const hourlyTop4 = new Map<number, Array<[string, number]>>()
     for (const [hour, processMap] of hourlyStats.entries()) {
@@ -683,7 +698,58 @@ export function apply(ctx: Context, config: Config) {
       hourlyTop4.set(hour, top4)
     }
 
-    const maxActivity = Math.max(...hourlyActivity.values(), 1)
+    const totalDuration = new Map<string, number>()
+    for (const processMap of hourlyStats.values()) {
+      for (const [process, duration] of processMap) {
+        totalDuration.set(process, (totalDuration.get(process) || 0) + duration)
+      }
+    }
+
+    const topDurationApps = [...totalDuration.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 6)
+
+    const topInputApps: Array<[string, InputAppStats & { duration: number }]> = topDurationApps.map(([process, duration]) => {
+      const stats = inputStatsMap.get(process) || {
+        displayName: process,
+        iconHash: '',
+        keyPresses: 0,
+        clicks: 0,
+        scrollDistance: 0,
+      }
+      return [process, { ...stats, duration }]
+    })
+
+    const maxKeys = Math.max(...topInputApps.map((a: any) => a[1].keyPresses), 1)
+    const maxClicks = Math.max(...topInputApps.map((a: any) => a[1].clicks), 1)
+    const maxScroll = Math.max(...topInputApps.map((a: any) => a[1].scrollDistance), 1)
+
+    const totalTrackedMinutes = topDurationApps.reduce((sum, [, minutes]) => sum + minutes, 0)
+    const pieColors = ['#ff8a65', '#4db6ac', '#64b5f6', '#ffd54f', '#81c784', '#ba68c8']
+    let cumulativePercent = 0
+    const pieSegments = topDurationApps.map(([process, minutes], idx) => {
+      const rawPercent = totalTrackedMinutes > 0 ? minutes / totalTrackedMinutes : 0
+      const startPercent = cumulativePercent
+      cumulativePercent += rawPercent
+      const endPercent = cumulativePercent
+      const startAngle = startPercent * Math.PI * 2 - Math.PI / 2
+      const endAngle = endPercent * Math.PI * 2 - Math.PI / 2
+      const largeArc = rawPercent > 0.5 ? 1 : 0
+      const x1 = 120 + Math.cos(startAngle) * 90
+      const y1 = 120 + Math.sin(startAngle) * 90
+      const x2 = 120 + Math.cos(endAngle) * 90
+      const y2 = 120 + Math.sin(endAngle) * 90
+      
+      let path = ''
+      if (totalTrackedMinutes > 0) {
+        if (rawPercent >= 0.999) {
+          path = `<circle cx="120" cy="120" r="90" fill="${pieColors[idx % pieColors.length]}"></circle>`
+        } else if (rawPercent > 0) {
+          path = `<path d="M 120 120 L ${x1.toFixed(2)} ${y1.toFixed(2)} A 90 90 0 ${largeArc} 1 ${x2.toFixed(2)} ${y2.toFixed(2)} Z" fill="${pieColors[idx % pieColors.length]}"></path>`
+        }
+      }
+      return { process, minutes, color: pieColors[idx % pieColors.length], path }
+    })
     const startHour = records.length > 0 ? Math.min(...records.map((r: any) => new Date(r.timestamp).getHours())) : 0
     const endHour = records.length > 0 ? Math.max(...records.map((r: any) => new Date(r.timestamp).getHours())) : 23
 
@@ -703,25 +769,33 @@ body{font-family:var(--font-body);color:var(--ink-primary);background-color:var(
 .section{margin-bottom:35px}
 .section-title{font-family:var(--font-title);font-size:1.5rem;margin-bottom:15px;color:var(--accent-orange);display:flex;align-items:center;gap:8px}
 .chart-box{background:#fff;padding:20px;border:2px solid var(--ink-primary);border-radius:12px;box-shadow:4px 4px 0 var(--color-green)}
-.chart{display:flex;align-items:flex-end;height:180px;gap:3px;padding:10px 0}
-.bar{flex:1;background:var(--accent-orange);border-radius:4px 4px 0 0;position:relative;min-height:2px}
-.bar-label{position:absolute;bottom:-22px;left:50%;transform:translateX(-50%);font-size:10px;color:var(--ink-secondary);white-space:nowrap}
+.pie-layout{display:grid;grid-template-columns:260px 1fr;gap:20px;align-items:center}
+.pie-wrap{display:flex;justify-content:center}
+.pie-svg{width:240px;height:240px;filter:drop-shadow(3px 3px 0 rgba(0,0,0,0.08))}
+.pie-center{font-family:var(--font-hand);font-size:0.95rem;fill:var(--ink-primary)}
+.pie-legend{display:flex;flex-direction:column;gap:10px}
+.pie-legend-item{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:8px 10px;border:1px dashed #e0d6d0;border-radius:10px;background:#fffaf5;min-width:0}
+.pie-legend-name{display:flex;align-items:center;gap:8px;min-width:0;font-size:0.9rem;font-weight:600;color:var(--ink-primary);flex:1}
+.pie-color{width:12px;height:12px;border-radius:999px;flex-shrink:0}
+.pie-legend-text{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:200px}
+.pie-legend-value{font-size:0.85rem;font-weight:700;color:var(--accent-orange);white-space:nowrap;flex-shrink:0}
+@media (max-width: 720px){.pie-layout{grid-template-columns:1fr}.pie-legend-text{max-width:none}.pie-legend-item{flex-direction:row}}
 .list-box{background:#fff;padding:20px;border:2px solid var(--ink-primary);border-radius:12px;box-shadow:4px 4px 0 var(--color-pink)}
 .list-item{display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px dashed #e0e0e0}
 .list-item:last-child{border-bottom:none}
-.item-name{font-weight:600;color:var(--ink-primary);flex:1}
-.item-value{color:var(--accent-orange);font-weight:600;margin-left:10px}
+.item-name{font-weight:600;color:var(--ink-primary);flex:1;min-width:0}
+.item-value{color:var(--accent-orange);font-weight:600;margin-left:10px;flex-shrink:0}
 .hour-section{margin-bottom:20px;padding:12px;border:1px dashed var(--ink-secondary);border-radius:8px;background:#fafafa}
 .hour-label{font-weight:700;color:var(--ink-secondary);margin-bottom:6px;font-size:0.95rem}
 .hour-list{display:flex;flex-wrap:wrap;gap:6px}
-.hour-tag{background:var(--color-blue);padding:3px 0;border-radius:12px;font-size:0.85rem;color:var(--ink-primary);display:inline-flex;overflow:hidden}
-.hour-tag-name{background:var(--color-blue);padding:3px 10px;color:var(--ink-primary)}
+.hour-tag{background:var(--color-blue);padding:3px 0;border-radius:12px;font-size:0.85rem;color:var(--ink-primary);display:inline-flex;overflow:hidden;align-items:center}
+.hour-tag-name{background:var(--color-blue);padding:3px 10px;color:var(--ink-primary);display:flex;align-items:center;gap:4px}
 .hour-tag-time{background:#fff;padding:3px 10px;color:var(--ink-primary);font-weight:600}
 .input-stats-item{padding:8px 0;border-bottom:1px dashed #e0e0e0}
 .input-stats-item:last-child{border-bottom:none}
 .app-row{display:grid;grid-template-columns:1fr 160px 120px 120px;align-items:center;gap:8px}
 .app-info{display:flex;align-items:center;gap:6px;overflow:hidden}
-.app-icon{width:16px;height:16px;border-radius:3px;flex-shrink:0}
+.app-icon{width:16px;height:16px;border-radius:3px;flex-shrink:0;object-fit:contain}
 .app-name{font-weight:600;color:var(--ink-primary);font-size:0.85rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .bar-col{display:flex;flex-direction:column;gap:2px}
 .bar-track{background:#f0f0f0;border-radius:4px;height:16px;position:relative;overflow:hidden}
@@ -744,18 +818,31 @@ body{font-family:var(--font-body);color:var(--ink-primary);background-color:var(
 </div>
 <div style="text-align:center;color:var(--ink-secondary);margin-bottom:30px;font-family:var(--font-hand)">设备: ${deviceId} · 统计时段: ${startHour}:00 - ${endHour}:59</div>
 <div class="section">
-<div class="section-title">📊 24H 活跃轨迹</div>
+<div class="section-title">🥧 应用时长占比</div>
 <div class="chart-box">
-<div class="chart">
-${Array.from(hourlyActivity.entries()).map(([hour, count]) => {
-      const height = count > 0 ? (count / maxActivity * 100) : 2
-      return `<div class="bar" style="height:${height}%"><div class="bar-label">${hour}</div></div>`
+${pieSegments.length > 0 ? `<div class="pie-layout">
+<div class="pie-wrap">
+  <svg class="pie-svg" viewBox="0 0 240 240" role="img" aria-label="应用时长占比饼图">
+    ${totalTrackedMinutes > 0 ? pieSegments.map((segment) => segment.path).join('') : `<circle cx="120" cy="120" r="90" fill="#f0f0f0" stroke="#ddd" stroke-width="2" stroke-dasharray="5,5"></circle>`}
+    <circle cx="120" cy="120" r="42" fill="#fffaf5" stroke="#eadfd8" stroke-width="2"></circle>
+    <text x="120" y="114" text-anchor="middle" class="pie-center">${totalTrackedMinutes > 0 ? '已统计' : '暂无数据'}</text>
+    <text x="120" y="134" text-anchor="middle" class="pie-center">${totalTrackedMinutes > 0 ? Math.round(totalTrackedMinutes) + 'm' : '-'}</text>
+  </svg>
+</div>
+<div class="pie-legend">
+  ${pieSegments.map((segment, idx) => {
+      const icon = iconMap.get(segment.process)
+      const displayName = inputStatsMap.get(segment.process)?.displayName
+      const iconHtml = icon ? `<img src="data:image/png;base64,${icon}" class="app-icon">` : '<div style="width:16px;height:16px;flex-shrink:0"></div>'
+      const percent = totalTrackedMinutes > 0 ? Math.round(segment.minutes / totalTrackedMinutes * 100) : 0
+      return `<div class="pie-legend-item"><div class="pie-legend-name"><span class="pie-color" style="background:${segment.color}"></span>${iconHtml}<span class="pie-legend-text">${idx + 1}. ${formatAppName(segment.process, displayName)}</span></div><span class="pie-legend-value">${Math.round(segment.minutes)}m · ${percent}%</span></div>`
     }).join('')}
 </div>
+</div>` : '<div style="color:var(--ink-secondary);text-align:center;padding:20px">暂无应用时长数据</div>'}
 </div>
 </div>
 <div class="section">
-<div class="section-title">⌨️ 输入统计 TOP 6</div>
+<div class="section-title">🏆 TOP 6 应用输入统计</div>
 <div class="list-box">
 ${topInputApps.length > 0 ? `
 <div class="stats-header">
@@ -777,7 +864,7 @@ ${topInputApps.map(([process, stats], idx) => {
   <div class="app-info">
     <span style="color:var(--ink-secondary);font-size:0.8rem;min-width:16px">${idx + 1}</span>
     ${iconData ? `<img src="data:image/png;base64,${iconData}" class="app-icon">` : '<div style="width:16px"></div>'}
-    <span class="app-name">${formatAppName(process)}</span>
+    <span class="app-name">${formatAppName(process, stats.displayName)}</span>
   </div>
   <div class="bar-col">
     <div class="bar-track"><div class="bar-fill-keys" style="width:${keysW}%">${keysInside ? `<span class="bar-text">${stats.keyPresses.toLocaleString()}</span>` : ''}</div>${!keysInside ? `<span style="position:absolute;right:4px;top:50%;transform:translateY(-50%);font-size:10px;font-weight:600;color:#888">${stats.keyPresses.toLocaleString()}</span>` : ''}</div>
@@ -793,13 +880,15 @@ ${topInputApps.map(([process, stats], idx) => {
     }).join('')}` : '<div style="color:var(--ink-secondary);text-align:center;padding:20px">暂无输入统计数据</div>'}
 </div>
 </div>
-${topBrowserDomains.length > 0 ? `<div class="section">
-<div class="section-title">🌐 浏览器活动 TOP 8</div>
+${topBrowserSites.length > 0 ? `<div class="section">
+<div class="section-title">🌐 浏览器记录 TOP 4</div>
 <div class="list-box">
-${topBrowserDomains.map(([domain, seconds], idx) => {
-      const minutes = Math.round(seconds / 60)
-      const display = minutes >= 60 ? `${Math.floor(minutes / 60)}h${minutes % 60}m` : minutes > 0 ? `${minutes}m` : `${Math.round(seconds)}s`
-      return `<div class="list-item"><span class="item-name">${idx + 1}. ${domain}</span><span class="item-value">${display}</span></div>`
+${topBrowserSites.map((item, idx) => {
+      const minutes = Math.round(item.seconds / 60)
+      const display = minutes >= 60 ? `${Math.floor(minutes / 60)}h${minutes % 60}m` : minutes > 0 ? `${minutes}m` : `${Math.round(item.seconds)}s`
+      const site = item.site || 'unknown'
+      const subtitle = item.domains.length > 0 ? `<div style="color:var(--ink-secondary);font-size:0.75rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${item.domains.join(' / ')}</div>` : ''
+      return `<div class="list-item"><span class="item-name">${idx + 1}. <span>${site}</span>${subtitle}</span><span class="item-value">${display}</span></div>`
     }).join('')}
 </div>
 </div>` : ''}
@@ -812,7 +901,8 @@ ${Array.from(hourlyTop4.entries()).filter(([, top]) => top.length > 0).map(([hou
 ${top.map(([app, dur]) => {
       const icon = iconMap.get(app)
       const iconHtml = icon ? `<img src="data:image/png;base64,${icon}" style="width:14px;height:14px;margin-right:3px;vertical-align:middle">` : ''
-      return `<span class="hour-tag"><span class="hour-tag-name">${iconHtml}${formatAppName(app)}</span><span class="hour-tag-time">${Math.round(dur)}m</span></span>`
+      const displayName = inputStatsMap.get(app)?.displayName
+      return `<span class="hour-tag"><span class="hour-tag-name">${iconHtml}${formatAppName(app, displayName)}</span><span class="hour-tag-time">${Math.round(dur)}m</span></span>`
     }).join('')}
 </div>
 </div>`).join('')}

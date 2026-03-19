@@ -5,6 +5,7 @@ WebUI 配置界面 + WebSocket 连接到 Koishi
 """
 import asyncio
 import base64
+import re
 import hashlib
 import io
 import json
@@ -28,18 +29,25 @@ from PIL import Image, ImageDraw
 # Windows 特定导入（可选）
 IS_WINDOWS = platform.system() == "Windows"
 WINDOWS_FEATURES = False
+PYWIN32_FEATURES = False
 TRAY_FEATURES = False
 if IS_WINDOWS:
     try:
-        from ctypes import windll, WINFUNCTYPE, c_int, c_void_p, byref
+        from ctypes import windll, WINFUNCTYPE, c_int, c_void_p, byref, create_unicode_buffer
+        from ctypes import wintypes
         from ctypes.wintypes import MSG
+        WINDOWS_FEATURES = True
+    except Exception as e:
+        print(f"Warning: Windows API features disabled: {e}")
+
+    try:
         import win32gui
         import win32process
         import win32api
         import win32con
-        WINDOWS_FEATURES = True
+        PYWIN32_FEATURES = True
     except Exception as e:
-        print(f"Warning: Windows API features disabled: {e}")
+        print(f"Warning: pywin32 features disabled: {e}")
 
     try:
         import pystray
@@ -105,10 +113,22 @@ def init_database():
         CREATE TABLE IF NOT EXISTS browser_activity (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             domain TEXT NOT NULL,
+            title TEXT,
+            url TEXT,
             seconds REAL DEFAULT 0,
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
+
+    try:
+        cursor.execute("ALTER TABLE browser_activity ADD COLUMN title TEXT")
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        cursor.execute("ALTER TABLE browser_activity ADD COLUMN url TEXT")
+    except sqlite3.OperationalError:
+        pass
 
     # 创建索引
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_activity_timestamp ON activity(timestamp)")
@@ -180,7 +200,130 @@ _icon_cache = {}  # process_name -> base64 string
 
 # 浏览器活动统计（由本地 /ws/browser 端点接收）
 _browser_stats_lock = threading.Lock()
-_browser_stats = {}  # domain -> seconds
+_browser_stats = {}  # page_key -> {domain, title, url, seconds}
+
+
+def _extract_domain(value: str) -> str:
+    try:
+        from urllib.parse import urlparse
+        return urlparse(value).netloc or value
+    except Exception:
+        return value
+
+
+def _normalize_site_label(value: str) -> str:
+    host = (value or "").strip().lower()
+    if not host:
+        return "unknown"
+
+    if "://" in host:
+        host = _extract_domain(host)
+
+    host = host.split(":", 1)[0].strip(".")
+    if not host:
+        return "unknown"
+
+    if host == "localhost" or host.replace(".", "").isdigit():
+        return host
+
+    parts = [part for part in host.split(".") if part]
+    if len(parts) <= 1:
+        return host
+
+    multi_suffixes = {
+        "co.uk", "org.uk", "gov.uk", "ac.uk",
+        "com.cn", "net.cn", "org.cn", "gov.cn", "edu.cn",
+        "com.hk", "com.tw"
+    }
+    suffix = ".".join(parts[-2:])
+    if suffix in multi_suffixes and len(parts) >= 3:
+        return parts[-3]
+    return parts[-2]
+
+
+def _extract_registered_domain(value: str) -> str:
+    host = (value or "").strip().lower()
+    if not host:
+        return "unknown"
+
+    if "://" in host:
+        host = _extract_domain(host)
+
+    host = host.split(":", 1)[0].strip(".")
+    if not host:
+        return "unknown"
+
+    if host == "localhost" or host.replace(".", "").isdigit():
+        return host
+
+    parts = [part for part in host.split(".") if part]
+    if len(parts) <= 2:
+        return host
+
+    multi_suffixes = {
+        "co.uk", "org.uk", "gov.uk", "ac.uk",
+        "com.cn", "net.cn", "org.cn", "gov.cn", "edu.cn",
+        "com.hk", "com.tw"
+    }
+    suffix = ".".join(parts[-2:])
+    if suffix in multi_suffixes and len(parts) >= 3:
+        return ".".join(parts[-3:])
+    return ".".join(parts[-2:])
+
+
+def _site_title_candidates(title: str) -> list[str]:
+    text = (title or "").strip()
+    if not text:
+        return []
+
+    parts = [part.strip() for part in re.split(r"\s+(?:[\|·—–-])\s+|\s*_\s*", text) if part.strip()]
+    if not parts:
+        return []
+    if len(parts) == 1:
+        return [parts[0]]
+
+    candidates = []
+    for candidate in (parts[0], parts[-1]):
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+    return candidates
+
+
+def _get_foreground_process_name() -> str:
+    if not (IS_WINDOWS and WINDOWS_FEATURES):
+        return "unknown"
+    try:
+        hwnd = windll.user32.GetForegroundWindow()
+        if not hwnd:
+            return "unknown"
+        pid = wintypes.DWORD()
+        windll.user32.GetWindowThreadProcessId(hwnd, byref(pid))
+        if not pid.value:
+            return "unknown"
+        return psutil.Process(pid.value).name()
+    except Exception:
+        return "unknown"
+
+
+def _get_foreground_window_info() -> dict:
+    if not (IS_WINDOWS and WINDOWS_FEATURES):
+        return {"title": "N/A", "process": "unknown", "pid": -1, "hwnd": 0}
+
+    try:
+        hwnd = windll.user32.GetForegroundWindow()
+        if not hwnd:
+            return {"title": "", "process": "unknown", "pid": -1, "hwnd": 0}
+
+        length = windll.user32.GetWindowTextLengthW(hwnd)
+        title_buf = create_unicode_buffer(length + 1)
+        windll.user32.GetWindowTextW(hwnd, title_buf, length + 1)
+
+        pid = wintypes.DWORD()
+        windll.user32.GetWindowThreadProcessId(hwnd, byref(pid))
+        process_name = psutil.Process(pid.value).name() if pid.value else "unknown"
+        return {"title": title_buf.value, "process": process_name, "pid": int(pid.value or 0), "hwnd": hwnd}
+    except Exception:
+        return {"title": "", "process": "unknown", "pid": -1, "hwnd": 0}
 
 if IS_WINDOWS and WINDOWS_FEATURES:
     import ctypes
@@ -214,10 +357,7 @@ if IS_WINDOWS and WINDOWS_FEATURES:
 
     def _get_current_process_name() -> str:
         try:
-            hwnd = win32gui.GetForegroundWindow()
-            _, pid = win32process.GetWindowThreadProcessId(hwnd)
-            proc = psutil.Process(pid)
-            return proc.name()
+            return _get_foreground_process_name()
         except Exception:
             return "unknown"
 
@@ -301,8 +441,8 @@ else:
 # ── 图标提取 ──────────────────────────────────────────────────────────────────
 def extract_icon_base64(process_name: str) -> tuple[str, str]:
     """提取图标并返回 (hash, base64_data)"""
-    if not (IS_WINDOWS and WINDOWS_FEATURES):
-        return "", ""  # 非 Windows 平台不支持图标提取
+    if not (IS_WINDOWS and PYWIN32_FEATURES):
+        return "", ""  # 缺少 pywin32 时跳过图标提取，但不影响采集
 
     if process_name in _icon_cache:
         return _icon_cache[process_name]
@@ -477,29 +617,28 @@ def query_daily_data(date_str: str = None) -> dict:
     if date_str is None:
         date_str = datetime.now().strftime("%Y-%m-%d")
 
-    start_time = f"{date_str} 00:00:00"
-    end_time = f"{date_str} 23:59:59"
+    date_expr = "date(replace(substr(timestamp, 1, 19), 'T', ' '))"
 
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
 
         # 查询活动记录
-        cursor.execute("""
+        cursor.execute(f"""
             SELECT process, title, timestamp FROM activity
-            WHERE timestamp BETWEEN ? AND ?
+            WHERE {date_expr} = ?
             ORDER BY timestamp
-        """, (start_time, end_time))
+        """, (date_str,))
         activities = [{"process": row[0], "title": row[1], "timestamp": row[2]} for row in cursor.fetchall()]
 
         # 查询输入统计
-        cursor.execute("""
+        cursor.execute(f"""
             SELECT process, display_name, icon_hash,
                    SUM(key_presses), SUM(left_clicks), SUM(right_clicks), SUM(scroll_distance)
             FROM input_stats
-            WHERE timestamp BETWEEN ? AND ?
+            WHERE {date_expr} = ?
             GROUP BY process
-        """, (start_time, end_time))
+        """, (date_str,))
         input_stats = {}
         icon_hashes = set()
         for row in cursor.fetchall():
@@ -515,14 +654,32 @@ def query_daily_data(date_str: str = None) -> dict:
                 icon_hashes.add(row[2])
 
         # 查询浏览器活动
-        cursor.execute("""
-            SELECT domain, SUM(seconds) FROM browser_activity
-            WHERE timestamp BETWEEN ? AND ?
-            GROUP BY domain
-        """, (start_time, end_time))
-        browser_activity = {}
+        cursor.execute(f"""
+            SELECT domain, title, url, seconds
+            FROM browser_activity
+            WHERE {date_expr} = ?
+            ORDER BY timestamp
+        """, (date_str,))
+        raw_browser_groups = {}
         for row in cursor.fetchall():
-            browser_activity[row[0]] = row[1]
+            domain, title, url, seconds = row
+            host = domain or _extract_domain(url or "") or "unknown"
+            reg_domain = _extract_registered_domain(host)
+            group = raw_browser_groups.get(reg_domain, {"seconds": 0, "domains": set(), "titles": {}})
+            group["seconds"] += seconds or 0
+            if host:
+                group["domains"].add(host)
+            for candidate in _site_title_candidates(title or ""):
+                group["titles"][candidate] = group["titles"].get(candidate, 0) + (seconds or 0)
+            raw_browser_groups[reg_domain] = group
+
+        browser_activity = {}
+        for reg_domain, item in raw_browser_groups.items():
+            best_title = max(item["titles"].items(), key=lambda kv: kv[1])[0] if item["titles"] else _normalize_site_label(reg_domain)
+            browser_activity[best_title] = {
+                "seconds": item["seconds"],
+                "domains": sorted(item["domains"]),
+            }
 
         # 查询图标数据
         icons = {}
@@ -558,10 +715,14 @@ def get_browser_stats_snapshot() -> dict:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         timestamp = datetime.now().isoformat()
-        for domain, seconds in snapshot.items():
+        for page_key, item in snapshot.items():
+            domain = item.get("domain") or page_key
+            title = item.get("title") or domain
+            url = item.get("url") or ""
+            seconds = item.get("seconds") or 0
             cursor.execute(
-                "INSERT INTO browser_activity (domain, seconds, timestamp) VALUES (?, ?, ?)",
-                (domain, seconds, timestamp)
+                "INSERT INTO browser_activity (domain, title, url, seconds, timestamp) VALUES (?, ?, ?, ?, ?)",
+                (domain, title, url, seconds, timestamp)
             )
         conn.commit()
         conn.close()
@@ -573,19 +734,8 @@ def get_browser_stats_snapshot() -> dict:
 
 # ── 窗口信息 ──────────────────────────────────────────────────────────────────
 def get_window_info() -> dict:
-    if IS_WINDOWS and WINDOWS_FEATURES:
-        try:
-            hwnd = win32gui.GetForegroundWindow()
-            title = win32gui.GetWindowText(hwnd)
-            _, pid = win32process.GetWindowThreadProcessId(hwnd)
-            proc = psutil.Process(pid)
-            process_name = proc.name()
-            return {"title": title, "process": process_name, "pid": pid}
-        except Exception:
-            return {"title": "", "process": "unknown", "pid": -1}
-    else:
-        # 非 Windows 平台简化实现
-        return {"title": "N/A", "process": "unknown", "pid": -1}
+    info = _get_foreground_window_info()
+    return {"title": info["title"], "process": info["process"], "pid": info["pid"]}
 
 
 # ── 系统状态 ──────────────────────────────────────────────────────────────────
@@ -623,10 +773,16 @@ def take_screenshot() -> str:
 
 def take_window_screenshot() -> str:
     if IS_WINDOWS and WINDOWS_FEATURES:
-        hwnd = win32gui.GetForegroundWindow()
-        rect = win32gui.GetWindowRect(hwnd)
-        x, y, x2, y2 = rect
-        img = pyautogui.screenshot(region=(x, y, x2 - x, y2 - y))
+        info = _get_foreground_window_info()
+        hwnd = info.get("hwnd", 0)
+        rect = wintypes.RECT()
+        if hwnd and windll.user32.GetWindowRect(hwnd, byref(rect)):
+            x, y = rect.left, rect.top
+            width = max(rect.right - rect.left, 1)
+            height = max(rect.bottom - rect.top, 1)
+            img = pyautogui.screenshot(region=(x, y, width, height))
+        else:
+            img = pyautogui.screenshot()
     else:
         img = pyautogui.screenshot()
     _save_to_screen_dir(img)
@@ -716,14 +872,23 @@ class MonitorLunaAgent:
         return connected
 
     async def _window_monitor(self, ws, device_id: str):
+        last_save_time = 0
         while self.running:
             try:
                 info = await asyncio.get_event_loop().run_in_executor(None, get_window_info)
                 key = (info["process"], info["title"])
-                if key != self._last_window:
-                    self._last_window = key
-                    # 只存储到本地数据库
-                    await asyncio.get_event_loop().run_in_executor(None, save_activity_to_db, info["process"], info["title"])
+                now = time.time()
+                
+                # 记录逻辑：窗口变化 OR 距离上次记录超过 5 分钟 (心跳)
+                if key != self._last_window or (now - last_save_time) > 300:
+                    # 改进：如果进程名为有效值，才进行记录（心跳不记录失败状态）
+                    is_valid = info["process"] not in ("unknown", "N/A", "")
+                    
+                    if key != self._last_window or is_valid:
+                        self._last_window = key
+                        last_save_time = now
+                        await asyncio.get_event_loop().run_in_executor(None, save_activity_to_db, info["process"], info["title"])
+                
                 if ws.closed:
                     break
             except asyncio.CancelledError:
@@ -998,9 +1163,25 @@ async def handle_browser_ws(request):
             if data.get("type") == "browser_activity":
                 stats = data.get("stats", {})
                 with _browser_stats_lock:
-                    for domain, seconds in stats.items():
+                    for key, item in stats.items():
+                        if isinstance(item, (int, float)):
+                            seconds = item
+                            url = ""
+                            title = key
+                            domain = key
+                        elif isinstance(item, dict):
+                            seconds = item.get("seconds", 0)
+                            url = item.get("url", "")
+                            title = item.get("title") or url or key
+                            domain = item.get("domain") or _extract_domain(url or key)
+                        else:
+                            continue
+
                         if isinstance(seconds, (int, float)) and seconds > 0:
-                            _browser_stats[domain] = _browser_stats.get(domain, 0) + seconds
+                            page_key = f"{title}\t{url}"
+                            existing = _browser_stats.get(page_key, {"domain": domain, "title": title, "url": url, "seconds": 0})
+                            existing["seconds"] = existing.get("seconds", 0) + seconds
+                            _browser_stats[page_key] = existing
         elif msg.type in (web.WSMsgType.ERROR, web.WSMsgType.CLOSE):
             break
 

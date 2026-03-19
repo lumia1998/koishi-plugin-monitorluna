@@ -2,7 +2,7 @@
 // @name         MonitorLuna Browser Tracker
 // @namespace    https://github.com/lumia1998/koishi-plugin-monitorluna
 // @version      2.0.0
-// @description  追踪浏览器各域名活跃时长，上报到本地 MonitorLuna Agent
+// @description  追踪浏览器各页面活跃时长，上报到本地 MonitorLuna Agent
 // @author       MonitorLuna
 // @match        *://*/*
 // @grant        GM_getValue
@@ -58,22 +58,33 @@
 
   function showStatus() {
     const state = ws ? ['CONNECTING','CONNECTED','CLOSING','CLOSED'][ws.readyState] : 'NO WS';
-    const domains = Object.entries(pendingStats)
+    const pages = Object.entries(pendingStats)
       .sort((a, b) => b[1] - a[1])
       .slice(0, 5)
-      .map(([d, s]) => `  ${d}: ${Math.round(s)}s`)
+      .map(([key, s]) => {
+        const [title] = key.split('\t')
+        return `  ${title}: ${Math.round(s)}s`
+      })
       .join('\n');
-    alert(`MonitorLuna 状态\n服务器: ${wsUrl}\n连接状态: ${state}\n\n待上报 TOP5:\n${domains || '  (暂无数据)'}`);
+    alert(`MonitorLuna 状态\n服务器: ${wsUrl}\n连接状态: ${state}\n\n待上报 TOP5:\n${pages || '  (暂无数据)'}`);
   }
 
   // ── 时长追踪 ─────────────────────────────────────────────────────────────
-  let pendingStats = {};   // domain -> seconds (本标签页待上报)
+  let pendingStats = {};   // pageKey -> seconds (本标签页待上报)
   let trackStart   = null; // 当前开始追踪的时间
   let isActive     = true; // 当前标签页是否处于活跃状态
   let lastActivity = Date.now();
 
-  const currentDomain = location.hostname;
-  if (!currentDomain) return; // about:blank 等跳过
+  function getPageTitle() {
+    const title = (document.title || '').trim();
+    return title || location.href;
+  }
+
+  function getPageKey() {
+    return `${getPageTitle()}\t${location.href}`;
+  }
+
+  if (!location.href || location.href === 'about:blank') return;
 
   function startTracking() {
     if (!isActive || trackStart !== null) return;
@@ -84,7 +95,8 @@
     if (trackStart === null) return;
     const elapsed = (Date.now() - trackStart) / 1000;
     if (elapsed > 0.5) {
-      pendingStats[currentDomain] = (pendingStats[currentDomain] || 0) + elapsed;
+      const pageKey = getPageKey();
+      pendingStats[pageKey] = (pendingStats[pageKey] || 0) + elapsed;
     }
     trackStart = null;
   }
@@ -183,7 +195,8 @@
     if (trackStart !== null && isActive) {
       const elapsed = (Date.now() - trackStart) / 1000;
       if (elapsed > 0.5) {
-        pendingStats[currentDomain] = (pendingStats[currentDomain] || 0) + elapsed;
+        const pageKey = getPageKey();
+        pendingStats[pageKey] = (pendingStats[pageKey] || 0) + elapsed;
         trackStart = Date.now(); // 重置，避免重复计算
       }
     }
@@ -191,9 +204,17 @@
     if (!wsReady || !ws || Object.keys(pendingStats).length === 0) return;
 
     const stats = {};
-    for (const [domain, secs] of Object.entries(pendingStats)) {
+    for (const [pageKey, secs] of Object.entries(pendingStats)) {
       const rounded = Math.round(secs);
-      if (rounded > 0) stats[domain] = rounded;
+      if (rounded > 0) {
+        const [title, url] = pageKey.split('\t');
+        stats[pageKey] = {
+          title: title || url || location.href,
+          url: url || location.href,
+          domain: location.hostname,
+          seconds: rounded,
+        };
+      }
     }
     if (Object.keys(stats).length === 0) return;
 
